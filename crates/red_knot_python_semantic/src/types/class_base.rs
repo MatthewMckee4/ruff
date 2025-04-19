@@ -115,7 +115,7 @@ impl<'db> ClassBase<'db> {
                 | KnownInstanceType::NotRequired
                 | KnownInstanceType::TypeGuard
                 | KnownInstanceType::TypeIs
-                | KnownInstanceType::TypingSelf
+                | KnownInstanceType::TypingSelf(_)
                 | KnownInstanceType::Unpack
                 | KnownInstanceType::ClassVar
                 | KnownInstanceType::Concatenate

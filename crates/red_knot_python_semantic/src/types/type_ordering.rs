@@ -273,8 +273,8 @@ pub(super) fn union_or_intersection_elements_ordering<'db>(
                 (KnownInstanceType::Unpack, _) => Ordering::Less,
                 (_, KnownInstanceType::Unpack) => Ordering::Greater,
 
-                (KnownInstanceType::TypingSelf, _) => Ordering::Less,
-                (_, KnownInstanceType::TypingSelf) => Ordering::Greater,
+                (KnownInstanceType::TypingSelf(_), _) => Ordering::Less,
+                (_, KnownInstanceType::TypingSelf(_)) => Ordering::Greater,
 
                 (KnownInstanceType::Required, _) => Ordering::Less,
                 (_, KnownInstanceType::Required) => Ordering::Greater,

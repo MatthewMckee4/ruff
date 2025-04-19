@@ -2440,7 +2440,7 @@ pub enum KnownInstanceType<'db> {
 
     // Various special forms, special aliases and type qualifiers that we don't yet understand
     // (all currently inferred as TODO in most contexts):
-    TypingSelf,
+    TypingSelf(ClassLiteralType<'db>),
     Final,
     ClassVar,
     Callable,
@@ -2470,7 +2470,7 @@ impl<'db> KnownInstanceType<'db> {
             | Self::Any
             | Self::Tuple
             | Self::Type
-            | Self::TypingSelf
+            | Self::TypingSelf(..)
             | Self::Final
             | Self::ClassVar
             | Self::Callable
@@ -2517,7 +2517,7 @@ impl<'db> KnownInstanceType<'db> {
             Self::Any => "typing.Any",
             Self::Tuple => "typing.Tuple",
             Self::Type => "typing.Type",
-            Self::TypingSelf => "typing.Self",
+            Self::TypingSelf(_) => "typing.Self",
             Self::Final => "typing.Final",
             Self::ClassVar => "typing.ClassVar",
             Self::Callable => "typing.Callable",
@@ -2565,7 +2565,7 @@ impl<'db> KnownInstanceType<'db> {
             Self::Any => KnownClass::Object,
             Self::Tuple => KnownClass::SpecialForm,
             Self::Type => KnownClass::SpecialForm,
-            Self::TypingSelf => KnownClass::SpecialForm,
+            Self::TypingSelf(_) => KnownClass::SpecialForm,
             Self::Final => KnownClass::SpecialForm,
             Self::ClassVar => KnownClass::SpecialForm,
             Self::Callable => KnownClass::SpecialForm,
@@ -2642,7 +2642,6 @@ impl<'db> KnownInstanceType<'db> {
             "Annotated" => Self::Annotated,
             "Literal" => Self::Literal,
             "Never" => Self::Never,
-            "Self" => Self::TypingSelf,
             "Final" => Self::Final,
             "Unpack" => Self::Unpack,
             "Required" => Self::Required,
@@ -2697,7 +2696,7 @@ impl<'db> KnownInstanceType<'db> {
             | Self::Literal
             | Self::LiteralString
             | Self::Never
-            | Self::TypingSelf
+            | Self::TypingSelf(_)
             | Self::Final
             | Self::Concatenate
             | Self::Unpack

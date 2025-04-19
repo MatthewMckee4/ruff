@@ -4391,7 +4391,7 @@ impl<'db> Type<'db> {
                 // TODO: Use an opt-in rule for a bare `Callable`
                 KnownInstanceType::Callable => Ok(Type::Callable(CallableType::unknown(db))),
 
-                KnownInstanceType::TypingSelf => Ok(todo_type!("Support for `typing.Self`")),
+                KnownInstanceType::TypingSelf(class) => Ok(Type::ClassLiteral(*class)),
                 KnownInstanceType::TypeAlias => Ok(todo_type!("Support for `typing.TypeAlias`")),
 
                 KnownInstanceType::Protocol => Err(InvalidTypeExpressionError {

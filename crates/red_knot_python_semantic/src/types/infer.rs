@@ -6487,6 +6487,7 @@ impl<'db> TypeInferenceBuilder<'db> {
         &mut self,
         annotation: &ast::Expr,
     ) -> TypeAndQualifiers<'db> {
+        println!("infer_annotation_expression_impl: {:?}", annotation);
         // https://typing.python.org/en/latest/spec/annotations.html#grammar-token-expression-grammar-annotation_expression
         let annotation_ty = match annotation {
             // String annotations: https://typing.python.org/en/latest/spec/annotations.html#string-annotations
@@ -7554,7 +7555,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                 );
                 Type::unknown()
             }
-            KnownInstanceType::TypingSelf
+            KnownInstanceType::TypingSelf(_)
             | KnownInstanceType::TypeAlias
             | KnownInstanceType::Unknown => {
                 self.context.report_lint_old(
