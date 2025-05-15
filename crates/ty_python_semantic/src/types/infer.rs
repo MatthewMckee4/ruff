@@ -85,12 +85,12 @@ use crate::types::unpacker::{UnpackResult, Unpacker};
 use crate::types::{
     binding_type, todo_type, CallDunderError, CallableSignature, CallableType, ClassLiteral,
     ClassType, DataclassParams, DynamicType, FunctionDecorators, FunctionType, GenericAlias,
-    IntersectionBuilder, IntersectionType, KnownClass, KnownFunction, KnownInstanceType,
-    MemberLookupPolicy, MetaclassCandidate, Parameter, ParameterForm, Parameters, Signature,
-    Signatures, StringLiteralType, SubclassOfType, Symbol, SymbolAndQualifiers, Truthiness,
-    TupleType, Type, TypeAliasType, TypeAndQualifiers, TypeArrayDisplay, TypeQualifiers,
-    TypeVarBoundOrConstraints, TypeVarInstance, TypeVarKind, TypeVarVariance, UnionBuilder,
-    UnionType,
+    IntersectionBuilder, IntersectionType, KnownClass, KnownConstant, KnownFunction,
+    KnownInstanceType, MemberLookupPolicy, MetaclassCandidate, Parameter, ParameterForm,
+    Parameters, Signature, Signatures, StringLiteralType, SubclassOfType, Symbol,
+    SymbolAndQualifiers, Truthiness, TupleType, Type, TypeAliasType, TypeAndQualifiers,
+    TypeArrayDisplay, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarInstance, TypeVarKind,
+    TypeVarVariance, UnionBuilder, UnionType,
 };
 use crate::unpack::{Unpack, UnpackPosition};
 use crate::util::subscript::{PyIndex, PySlice};
@@ -1678,6 +1678,22 @@ impl<'db> TypeInferenceBuilder<'db> {
         })
     }
 
+    /// Returns `true` if the current scope is in a block where `TYPE_CHECKING` is true
+    fn in_type_checking_context(&self) -> bool {
+        let current_scope_id = self.scope().file_scope_id(self.db());
+        let current_scope = self.index.scope(current_scope_id);
+        println!("current_scope: {:?}", current_scope);
+        let Some(parent_scope_id) = current_scope.parent() else {
+            return false;
+        };
+        let parent_scope = self.index.scope(parent_scope_id);
+
+        println!("parent_scope: {:?}", parent_scope);
+
+        println!("descendants: {:?}", parent_scope.descendants());
+        false
+    }
+
     fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
         // Parameters are odd: they are Definitions in the function body scope, but have no
         // constituent nodes that are part of the function body. In order to get diagnostics
@@ -1706,7 +1722,8 @@ impl<'db> TypeInferenceBuilder<'db> {
 
             if (self.in_stub()
                 || self.in_function_overload_or_abstractmethod()
-                || self.in_protocol_class())
+                || self.in_protocol_class()
+                || self.in_type_checking_context())
                 && self.return_types_and_ranges.is_empty()
                 && is_stub_suite(&function.body)
             {
@@ -3332,7 +3349,10 @@ impl<'db> TypeInferenceBuilder<'db> {
                 // `TYPE_CHECKING` is a special variable that should only be assigned `False`
                 // at runtime, but is always considered `True` in type checking.
                 // See mdtest/known_constants.md#user-defined-type_checking for details.
-                if target.as_name_expr().map(|name| name.id.as_str()) == Some("TYPE_CHECKING") {
+                let target_known_constant = target.as_name_expr().and_then(|name| {
+                    KnownConstant::try_from_definition_and_name(self.db(), definition, &name.id)
+                });
+                if matches!(target_known_constant, Some(KnownConstant::TypeChecking)) {
                     if !matches!(
                         value.as_boolean_literal_expr(),
                         Some(ast::ExprBooleanLiteral { value: false, .. })
@@ -3403,10 +3423,11 @@ impl<'db> TypeInferenceBuilder<'db> {
             DeferredExpressionState::from(self.defer_annotations()),
         );
 
-        if target
-            .as_name_expr()
-            .is_some_and(|name| &name.id == "TYPE_CHECKING")
-        {
+        let target_known_constant = target.as_name_expr().and_then(|name| {
+            KnownConstant::try_from_definition_and_name(self.db(), definition, &name.id)
+        });
+
+        if matches!(target_known_constant, Some(KnownConstant::TypeChecking)) {
             if !KnownClass::Bool
                 .to_instance(self.db())
                 .is_assignable_to(self.db(), declared_ty.inner_type())
@@ -3456,9 +3477,7 @@ impl<'db> TypeInferenceBuilder<'db> {
 
         if let Some(value) = value {
             let inferred_ty = self.infer_expression(value);
-            let inferred_ty = if target
-                .as_name_expr()
-                .is_some_and(|name| &name.id == "TYPE_CHECKING")
+            let inferred_ty = if matches!(target_known_constant, Some(KnownConstant::TypeChecking))
             {
                 Type::BooleanLiteral(true)
             } else if self.in_stub() && value.is_ellipsis_literal_expr() {

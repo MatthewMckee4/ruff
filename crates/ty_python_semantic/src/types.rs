@@ -7064,6 +7064,41 @@ impl KnownFunction {
     }
 }
 
+/// Non-exhaustive enumeration of known constants (e.g. `typing(_extensions).TYPE_CHECKING`, ...)
+/// that might have special behavior.
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, Hash, strum_macros::EnumString, strum_macros::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[cfg_attr(test, derive(strum_macros::EnumIter))]
+pub enum KnownConstant {
+    /// `typing(_extensions).TYPE_CHECKING`
+    #[strum(serialize = "TYPE_CHECKING")]
+    TypeChecking,
+}
+
+impl KnownConstant {
+    pub(crate) fn try_from_definition_and_name<'db>(
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+        name: &str,
+    ) -> Option<Self> {
+        let candidate = Self::from_str(name).ok()?;
+        candidate
+            .check_module(file_to_module(db, definition.file(db))?.known()?)
+            .then_some(candidate)
+    }
+
+    /// Return `true` if `self` is defined in `module` at runtime.
+    const fn check_module(self, module: KnownModule) -> bool {
+        match self {
+            Self::TypeChecking => {
+                matches!(module, KnownModule::Typing | KnownModule::TypingExtensions)
+            }
+        }
+    }
+}
+
 /// This type represents bound method objects that are created when a method is accessed
 /// on an instance of a class. For example, the expression `Path("a.txt").touch` creates
 /// a bound method object that represents the `Path.touch` method which is bound to the
