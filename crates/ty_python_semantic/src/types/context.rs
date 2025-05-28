@@ -37,6 +37,7 @@ pub(crate) struct InferContext<'db> {
     file: File,
     diagnostics: std::cell::RefCell<TypeCheckDiagnostics>,
     no_type_check: InNoTypeCheck,
+    in_type_checking_block: bool,
     bomb: DebugDropBomb,
 }
 
@@ -48,6 +49,7 @@ impl<'db> InferContext<'db> {
             file: scope.file(db),
             diagnostics: std::cell::RefCell::new(TypeCheckDiagnostics::default()),
             no_type_check: InNoTypeCheck::default(),
+            in_type_checking_block: false,
             bomb: DebugDropBomb::new(
                 "`InferContext` needs to be explicitly consumed by calling `::finish` to prevent accidental loss of diagnostics.",
             ),
@@ -147,6 +149,10 @@ impl<'db> InferContext<'db> {
         self.no_type_check = no_type_check;
     }
 
+    pub(super) fn set_in_type_checking_block(&mut self, in_type_checking_block: bool) {
+        self.in_type_checking_block = in_type_checking_block;
+    }
+
     fn is_in_no_type_check(&self) -> bool {
         match self.no_type_check {
             InNoTypeCheck::Possibly => {
@@ -170,6 +176,10 @@ impl<'db> InferContext<'db> {
             }
             InNoTypeCheck::Yes => true,
         }
+    }
+
+    pub(crate) fn is_in_type_checking_block(&self) -> bool {
+        self.in_type_checking_block
     }
 
     /// Are we currently inferring types in a stub file?

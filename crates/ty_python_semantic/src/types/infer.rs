@@ -1787,6 +1787,9 @@ impl<'db> TypeInferenceBuilder<'db> {
                 if self.in_function_overload_or_abstractmethod() {
                     return;
                 }
+                if self.context.is_in_type_checking_block() {
+                    return;
+                }
                 if let Some(class) = self.class_context_of_current_method() {
                     enclosing_class_context = Some(class);
                     if class.is_protocol(self.db()) {
@@ -2404,11 +2407,19 @@ impl<'db> TypeInferenceBuilder<'db> {
 
         let test_ty = self.infer_standalone_expression(test);
 
+        if let Some(name) = test.clone().name_expr() {
+            if name.id == "TYPE_CHECKING" {
+                self.context.set_in_type_checking_block(true);
+            }
+        }
+
         if let Err(err) = test_ty.try_bool(self.db()) {
             err.report_diagnostic(&self.context, &**test);
         }
 
         self.infer_body(body);
+
+        self.context.set_in_type_checking_block(false);
 
         for clause in elif_else_clauses {
             let ast::ElifElseClause {
