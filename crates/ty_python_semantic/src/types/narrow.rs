@@ -20,7 +20,8 @@ use ruff_python_ast::{BoolOp, ExprBoolOp};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 
-use super::{KnownFunction, UnionType};
+use super::infer::TypeInference;
+use super::{KnownFunction, TupleType, UnionType};
 
 /// Return the type constraint that `test` (if true) would place on `symbol`, if any.
 ///
@@ -575,6 +576,82 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
         }
     }
 
+    fn evaluate_expr_compare_call(
+        &mut self,
+        expr_call: &ast::ExprCall,
+        lhs_ty: Type<'db>,
+        rhs_ty: Type<'db>,
+        op: ast::CmpOp,
+        scope: ScopeId<'db>,
+        inference: &TypeInference<'db>,
+    ) -> Option<(ScopedSymbolId, Type<'db>)> {
+        let ast::ExprCall {
+            range: _,
+            func: callable,
+            arguments:
+                ast::Arguments {
+                    args,
+                    keywords,
+                    range: _,
+                },
+        } = expr_call;
+
+        if keywords.is_empty() {
+            let [first_arg] = &**args else { return None };
+
+            let id = expr_name(first_arg)?;
+
+            let symbol = self.expect_expr_name_symbol(id);
+
+            let callable_type =
+                inference.expression_type(callable.scoped_expression_id(self.db, scope));
+
+            match callable_type {
+                Type::ClassLiteral(class) if class.is_known(self.db, KnownClass::Type) => {
+                    if op != ast::CmpOp::Is {
+                        return None;
+                    }
+
+                    let rhs_class = match rhs_ty {
+                        Type::ClassLiteral(class) => class,
+                        Type::GenericAlias(alias) => alias.origin(self.db),
+                        _ => {
+                            return None;
+                        }
+                    };
+
+                    Some((
+                        symbol,
+                        Type::instance(self.db, rhs_class.unknown_specialization(self.db)),
+                    ))
+                }
+                Type::FunctionLiteral(function_type)
+                    if function_type.is_known(self.db, KnownFunction::Len) =>
+                {
+                    let first_arg_ty =
+                        inference.expression_type(first_arg.scoped_expression_id(self.db, scope));
+                    println!("first_arg_ty: {:?}", first_arg_ty);
+                    println!("rhs_ty: {:?}", rhs_ty);
+                    println!("op: {:?}", op);
+                    match rhs_ty {
+                        Type::IntLiteral(i) => match op {
+                            ast::CmpOp::Eq => {
+                                println!("i: {:?}", i);
+                                let elements = vec![Type::any(); i as usize];
+                                Some((symbol, TupleType::from_elements(self.db, elements)))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     fn evaluate_expr_compare(
         &mut self,
         expr_compare: &ast::ExprCompare,
@@ -628,65 +705,23 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
             let rhs_ty = inference.expression_type(right.scoped_expression_id(self.db, scope));
             last_rhs_ty = Some(rhs_ty);
 
+            let op = if is_positive { *op } else { op.negate() };
+
             match left {
                 ast::Expr::Name(_) | ast::Expr::Named(_) => {
                     if let Some(id) = expr_name(left) {
                         let symbol = self.expect_expr_name_symbol(id);
-                        let op = if is_positive { *op } else { op.negate() };
 
                         if let Some(ty) = self.evaluate_expr_compare_op(lhs_ty, rhs_ty, op) {
                             constraints.insert(symbol, ty);
                         }
                     }
                 }
-                ast::Expr::Call(ast::ExprCall {
-                    range: _,
-                    func: callable,
-                    arguments:
-                        ast::Arguments {
-                            args,
-                            keywords,
-                            range: _,
-                        },
-                }) if keywords.is_empty() => {
-                    let rhs_class = match rhs_ty {
-                        Type::ClassLiteral(class) => class,
-                        Type::GenericAlias(alias) => alias.origin(self.db),
-                        _ => {
-                            continue;
-                        }
-                    };
-
-                    let id = match &**args {
-                        [first] => match expr_name(first) {
-                            Some(id) => id,
-                            None => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    let is_valid_constraint = if is_positive {
-                        op == &ast::CmpOp::Is
-                    } else {
-                        op == &ast::CmpOp::IsNot
-                    };
-
-                    if !is_valid_constraint {
-                        continue;
-                    }
-
-                    let callable_type =
-                        inference.expression_type(callable.scoped_expression_id(self.db, scope));
-
-                    if callable_type
-                        .into_class_literal()
-                        .is_some_and(|c| c.is_known(self.db, KnownClass::Type))
+                ast::Expr::Call(expr_call) => {
+                    if let Some((symbol, ty)) = self
+                        .evaluate_expr_compare_call(expr_call, lhs_ty, rhs_ty, op, scope, inference)
                     {
-                        let symbol = self.expect_expr_name_symbol(id);
-                        constraints.insert(
-                            symbol,
-                            Type::instance(self.db, rhs_class.unknown_specialization(self.db)),
-                        );
+                        constraints.insert(symbol, ty);
                     }
                 }
                 _ => {}
