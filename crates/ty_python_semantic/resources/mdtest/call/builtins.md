@@ -57,7 +57,7 @@ type("Foo", Base, {})
 # error: [no-matching-overload] "No overload of class `type` matches arguments"
 type("Foo", (1, 2), {})
 
-# TODO: this should be an error
+# error: [no-matching-overload] "No overload of class `type` matches arguments"
 type("Foo", (Base,), {b"attr": 1})
 ```
 

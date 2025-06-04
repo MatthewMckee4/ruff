@@ -94,8 +94,8 @@ use crate::types::{
     KnownInstanceType, MemberLookupPolicy, MetaclassCandidate, PEP695TypeAliasType, Parameter,
     ParameterForm, Parameters, SpecialFormType, StringLiteralType, SubclassOfType, Symbol,
     SymbolAndQualifiers, Truthiness, TupleType, Type, TypeAliasType, TypeAndQualifiers,
-    TypeArrayDisplay, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarInstance, TypeVarKind,
-    TypeVarVariance, UnionBuilder, UnionType, binding_type, todo_type,
+    TypeArrayDisplay, TypeMapping, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarInstance,
+    TypeVarKind, TypeVarVariance, UnionBuilder, UnionType, binding_type, todo_type,
 };
 use crate::unpack::{Unpack, UnpackPosition};
 use crate::util::subscript::{PyIndex, PySlice};
@@ -4627,13 +4627,54 @@ impl<'db> TypeInferenceBuilder<'db> {
     fn infer_dict_expression(&mut self, dict: &ast::ExprDict) -> Type<'db> {
         let ast::ExprDict { range: _, items } = dict;
 
-        for item in items {
-            self.infer_optional_expression(item.key.as_ref());
-            self.infer_expression(&item.value);
-        }
+        println!("{:?}", items);
+        // let key_values: Vec<_> = items.iter().map(|item| {
+        //     if item.key.is_none() {
+        //         // unpacking
+        //         let inferred_value = self.infer_expression(&item.value);
+        //         match
+        //     } else {
+        //         let inferred_key = self.infer_optional_expression(item.key.as_ref());
+        //         let inferred_value = self.infer_expression(&item.value);
+        //     }
+        // });
 
-        // TODO generic
-        KnownClass::Dict.to_instance(self.db())
+        let keys: Vec<_> = items
+            .iter()
+            .filter_map(|item| {
+                let inferred = self.infer_optional_expression(item.key.as_ref());
+                inferred.map(|inferred| {
+                    inferred.apply_type_mapping(self.db(), &TypeMapping::PromoteLiterals)
+                })
+            })
+            .collect();
+
+        let values: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let inferred = self.infer_expression(&item.value);
+                inferred.apply_type_mapping(self.db(), &TypeMapping::PromoteLiterals)
+            })
+            .collect();
+
+        match (keys.is_empty(), values.is_empty()) {
+            (true, true) => KnownClass::Dict.to_instance(self.db()),
+            (true, false) => KnownClass::Dict.to_specialized_instance(
+                self.db(),
+                [Type::unknown(), UnionType::from_elements(self.db(), values)],
+            ),
+            (false, true) => KnownClass::Dict.to_specialized_instance(
+                self.db(),
+                [UnionType::from_elements(self.db(), keys), Type::unknown()],
+            ),
+            (false, false) => KnownClass::Dict.to_specialized_instance(
+                self.db(),
+                [
+                    UnionType::from_elements(self.db(), keys),
+                    UnionType::from_elements(self.db(), values),
+                ],
+            ),
+        }
     }
 
     /// Infer the type of the `iter` expression of the first comprehension.
