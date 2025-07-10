@@ -8,12 +8,20 @@ pub(crate) struct ResolvedClientCapabilities {
     pub(crate) document_changes: bool,
     pub(crate) diagnostics_refresh: bool,
     pub(crate) inlay_refresh: bool,
+
+    /// Whether [pull diagnostics] is supported.
+    ///
+    /// [pull diagnostics]: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_pullDiagnostics
     pub(crate) pull_diagnostics: bool,
+
     /// Whether `textDocument.typeDefinition.linkSupport` is `true`
     pub(crate) type_definition_link_support: bool,
 
     /// `true`, if the first markup kind in `textDocument.hover.contentFormat` is `Markdown`
     pub(crate) hover_prefer_markdown: bool,
+
+    /// Whether the client supports multiline semantic tokens
+    pub(crate) semantic_tokens_multiline_support: bool,
 }
 
 impl ResolvedClientCapabilities {
@@ -80,6 +88,13 @@ impl ResolvedClientCapabilities {
             })
             .unwrap_or_default();
 
+        let semantic_tokens_multiline_support = client_capabilities
+            .text_document
+            .as_ref()
+            .and_then(|doc| doc.semantic_tokens.as_ref())
+            .and_then(|semantic_tokens| semantic_tokens.multiline_token_support)
+            .unwrap_or(false);
+
         Self {
             code_action_deferred_edit_resolution: code_action_data_support
                 && code_action_edit_resolution,
@@ -90,6 +105,7 @@ impl ResolvedClientCapabilities {
             pull_diagnostics,
             type_definition_link_support: declaration_link_support,
             hover_prefer_markdown,
+            semantic_tokens_multiline_support,
         }
     }
 }
