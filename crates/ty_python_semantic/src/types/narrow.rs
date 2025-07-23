@@ -7,7 +7,8 @@ use crate::semantic_index::predicate::{
 };
 use crate::types::enums::{enum_member_literals, enum_metadata};
 use crate::types::function::KnownFunction;
-use crate::types::infer::infer_same_file_expression_type;
+use crate::types::infer::{ExpressionInference, infer_same_file_expression_type};
+use crate::types::tuple::{FixedLengthTuple, TupleLength, TupleSpec, TupleType};
 use crate::types::{
     ClassLiteral, ClassType, IntersectionBuilder, KnownClass, SubclassOfInner, SubclassOfType,
     Truthiness, Type, TypeVarBoundOrConstraints, UnionBuilder, infer_expression_types,
@@ -663,6 +664,93 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    fn evaluate_expr_compare_call(
+        &mut self,
+        inference: &ExpressionInference<'db>,
+        expr_call: &ast::ExprCall,
+        rhs_ty: Type<'db>,
+        op: ast::CmpOp,
+        is_positive: bool,
+    ) -> Option<(PlaceExpr, Type<'db>)> {
+        let ast::ExprCall {
+            range: _,
+            node_index: _,
+            func: callable,
+            arguments: ast::Arguments { args, keywords, .. },
+        } = expr_call;
+
+        if !keywords.is_empty() {
+            return None;
+        }
+
+        let callable_type = inference.expression_type(&**callable);
+
+        match callable_type {
+            Type::ClassLiteral(class) if class.is_known(self.db, KnownClass::Type) => {
+                let rhs_class = match rhs_ty {
+                    Type::ClassLiteral(class) => class,
+                    Type::GenericAlias(alias) => alias.origin(self.db),
+                    _ => return None,
+                };
+
+                let target = match &**args {
+                    [first] => place_expr(first)?,
+                    _ => return None,
+                };
+
+                let is_valid_constraint = if is_positive {
+                    op == ast::CmpOp::Is
+                } else {
+                    op == ast::CmpOp::IsNot
+                };
+
+                if !is_valid_constraint {
+                    return None;
+                }
+
+                Some((
+                    target,
+                    Type::instance(self.db, rhs_class.unknown_specialization(self.db)),
+                ))
+            }
+            Type::FunctionLiteral(function_type)
+                if matches!(
+                    function_type.known(self.db),
+                    None | Some(KnownFunction::Len)
+                ) =>
+            {
+                let length = rhs_ty.into_int_literal()?;
+
+                let target = match &**args {
+                    [first] => place_expr(first)?,
+                    _ => return None,
+                };
+
+                let is_valid_constraint = if is_positive {
+                    op == ast::CmpOp::Eq
+                } else {
+                    op == ast::CmpOp::NotEq
+                };
+
+                if !is_valid_constraint {
+                    return None;
+                }
+
+                let ty = TupleType::from_elements(
+                    self.db,
+                    std::iter::repeat_n(Type::unknown(), length as usize),
+                );
+
+                if is_positive {
+                    Some((target, ty))
+                } else {
+                    Some((target, ty.negate(self.db)))
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn evaluate_expr_compare(
         &mut self,
         expr_compare: &ast::ExprCompare,
@@ -733,55 +821,17 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                         }
                     }
                 }
-                ast::Expr::Call(ast::ExprCall {
-                    range: _,
-                    node_index: _,
-                    func: callable,
-                    arguments:
-                        ast::Arguments {
-                            args,
-                            keywords,
-                            range: _,
-                            node_index: _,
-                        },
-                }) if keywords.is_empty() => {
-                    let rhs_class = match rhs_ty {
-                        Type::ClassLiteral(class) => class,
-                        Type::GenericAlias(alias) => alias.origin(self.db),
-                        _ => {
-                            continue;
-                        }
-                    };
-
-                    let target = match &**args {
-                        [first] => match place_expr(first) {
-                            Some(target) => target,
-                            None => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    let is_valid_constraint = if is_positive {
-                        op == &ast::CmpOp::Is
-                    } else {
-                        op == &ast::CmpOp::IsNot
-                    };
-
-                    if !is_valid_constraint {
-                        continue;
-                    }
-
-                    let callable_type = inference.expression_type(&**callable);
-
-                    if callable_type
-                        .into_class_literal()
-                        .is_some_and(|c| c.is_known(self.db, KnownClass::Type))
-                    {
-                        let place = self.expect_place(&target);
-                        constraints.insert(
-                            place,
-                            Type::instance(self.db, rhs_class.unknown_specialization(self.db)),
-                        );
+                ast::Expr::Call(expr_call) => {
+                    if let Some((left, ty)) = self.evaluate_expr_compare_call(
+                        inference,
+                        expr_call,
+                        rhs_ty,
+                        *op,
+                        is_positive,
+                    ) {
+                        println!("ty: {:?}", ty.display(self.db));
+                        let place = self.expect_place(&left);
+                        constraints.insert(place, ty);
                     }
                 }
                 _ => {}

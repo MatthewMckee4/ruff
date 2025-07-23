@@ -238,3 +238,15 @@ def _(s: LiteralString | None, t: LiteralString | Any):
         # TODO could be `Literal["foo"] | Any`
         reveal_type(t)  # revealed: LiteralString | Any
 ```
+
+## Narrowing tuples with `len`
+
+```py
+from typing import Literal
+
+def _(x: tuple[int] | tuple[str, int]):
+    if len(x) == 1:
+        reveal_type(x)  # revealed: tuple[int]
+    else:
+        reveal_type(x)  # revealed: tuple[str, int]
+```
