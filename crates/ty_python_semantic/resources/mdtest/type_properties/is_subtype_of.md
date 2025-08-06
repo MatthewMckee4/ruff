@@ -19,10 +19,10 @@ See the [typing documentation] for more information.
 ## Basic builtin types
 
 - `bool` is a subtype of `int`. This is modeled after Python's runtime behavior, where `int` is a
-    supertype of `bool` (present in `bool`s bases and MRO).
+  supertype of `bool` (present in `bool`s bases and MRO).
 - `int` is not a subtype of `float`/`complex`, although this is muddied by the
-    [special case for float and complex] where annotations of `float` and `complex` are interpreted
-    as `int | float` and `int | float | complex`, respectively.
+  [special case for float and complex] where annotations of `float` and `complex` are interpreted
+  as `int | float` and `int | float | complex`, respectively.
 
 ```py
 from ty_extensions import is_subtype_of, static_assert, JustFloat, JustComplex
@@ -1798,6 +1798,18 @@ class F(metaclass=MetaWithIntReturn):
 static_assert(is_subtype_of(TypeOf[F], Callable[[], int]))
 static_assert(not is_subtype_of(TypeOf[F], Callable[[], str]))
 static_assert(not is_subtype_of(TypeOf[F], Callable[[int], F]))
+```
+
+#### Classes with `__new__` of different types
+
+```py
+from typing import Callable
+from ty_extensions import TypeOf, static_assert, is_subtype_of
+
+class Aa:
+    __new__: Callable[["Aa", int], str]
+
+static_assert(is_subtype_of(TypeOf[Aa], Callable[[int], str]))
 ```
 
 ### Subclass of

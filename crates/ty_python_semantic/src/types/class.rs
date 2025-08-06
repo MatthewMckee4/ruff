@@ -943,41 +943,42 @@ impl<'db> ClassType<'db> {
             )
             .place;
 
-        let dunder_new_signature = dunder_new_function_symbol
-            .ignore_possibly_unbound()
-            .and_then(|ty| match ty {
+        let place_signature = |place: Place<'db>| {
+            place.ignore_possibly_unbound().and_then(|ty| match ty {
                 Type::FunctionLiteral(function) => Some(function.signature(db)),
                 Type::Callable(callable) => Some(callable.signatures(db)),
                 _ => None,
-            });
-
-        let dunder_new_function = if let Some(dunder_new_signature) = dunder_new_signature {
-            // Step 3: If the return type of the `__new__` evaluates to a type that is not a subclass of this class,
-            // then we should ignore the `__init__` and just return the `__new__` method.
-            let returns_non_subclass = dunder_new_signature.overloads.iter().any(|signature| {
-                signature.return_ty.is_some_and(|return_ty| {
-                    !return_ty.is_assignable_to(
-                        db,
-                        self_ty
-                            .to_instance(db)
-                            .expect("ClassType should be instantiable"),
-                    )
-                })
-            });
-
-            let dunder_new_bound_method = Type::Callable(CallableType::new(
-                db,
-                dunder_new_signature.bind_self(),
-                true,
-            ));
-
-            if returns_non_subclass {
-                return dunder_new_bound_method;
-            }
-            Some(dunder_new_bound_method)
-        } else {
-            None
+            })
         };
+
+        let dunder_new_function =
+            if let Some(dunder_new_signature) = place_signature(dunder_new_function_symbol) {
+                // Step 3: If the return type of the `__new__` evaluates to a type that is not a subclass of this class,
+                // then we should ignore the `__init__` and just return the `__new__` method.
+                let returns_non_subclass = dunder_new_signature.overloads.iter().any(|signature| {
+                    signature.return_ty.is_some_and(|return_ty| {
+                        !return_ty.is_assignable_to(
+                            db,
+                            self_ty
+                                .to_instance(db)
+                                .expect("ClassType should be instantiable"),
+                        )
+                    })
+                });
+
+                let dunder_new_bound_method = Type::Callable(CallableType::new(
+                    db,
+                    dunder_new_signature.bind_self(),
+                    true,
+                ));
+
+                if returns_non_subclass {
+                    return dunder_new_bound_method;
+                }
+                Some(dunder_new_bound_method)
+            } else {
+                None
+            };
 
         let dunder_init_function_symbol = self_ty
             .member_lookup_with_policy(
@@ -994,34 +995,22 @@ impl<'db> ClassType<'db> {
         // same parameters as the `__init__` method after it is bound, and with the return type of
         // the concrete type of `Self`.
         let synthesized_dunder_init_callable =
-            if let Place::Type(ty, _) = dunder_init_function_symbol {
-                let signature = match ty {
-                    Type::FunctionLiteral(dunder_init_function) => {
-                        Some(dunder_init_function.signature(db))
-                    }
-                    Type::Callable(callable) => Some(callable.signatures(db)),
-                    _ => None,
+            if let Some(signature) = place_signature(dunder_init_function_symbol) {
+                let synthesized_signature = |signature: &Signature<'db>| {
+                    Signature::new(signature.parameters().clone(), Some(correct_return_type))
+                        .with_definition(signature.definition())
+                        .bind_self()
                 };
 
-                if let Some(signature) = signature {
-                    let synthesized_signature = |signature: &Signature<'db>| {
-                        Signature::new(signature.parameters().clone(), Some(correct_return_type))
-                            .with_definition(signature.definition())
-                            .bind_self()
-                    };
+                let synthesized_dunder_init_signature = CallableSignature::from_overloads(
+                    signature.overloads.iter().map(synthesized_signature),
+                );
 
-                    let synthesized_dunder_init_signature = CallableSignature::from_overloads(
-                        signature.overloads.iter().map(synthesized_signature),
-                    );
-
-                    Some(Type::Callable(CallableType::new(
-                        db,
-                        synthesized_dunder_init_signature,
-                        true,
-                    )))
-                } else {
-                    None
-                }
+                Some(Type::Callable(CallableType::new(
+                    db,
+                    synthesized_dunder_init_signature,
+                    true,
+                )))
             } else {
                 None
             };
