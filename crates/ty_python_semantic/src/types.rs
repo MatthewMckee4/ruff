@@ -5512,7 +5512,7 @@ impl<'db> Type<'db> {
     }
 
     #[must_use]
-    pub(crate) fn to_instance(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    pub fn to_instance(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
             Type::Dynamic(_) | Type::Never => Some(self),
             Type::ClassLiteral(class) => Some(Type::instance(db, class.default_specialization(db))),
