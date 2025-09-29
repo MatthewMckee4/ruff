@@ -338,7 +338,7 @@ impl<'db> OverloadLiteral<'db> {
     /// calling query is not in the same file as this function is defined in, then this will create
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
-    pub(crate) fn signature(
+    pub fn signature(
         self,
         db: &'db dyn Db,
         inherited_generic_context: Option<GenericContext<'db>>,
