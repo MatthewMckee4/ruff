@@ -78,7 +78,7 @@ pub use special_form::SpecialFormType;
 
 mod builder;
 mod call;
-pub mod class;
+mod class;
 mod class_base;
 mod constraints;
 mod context;
@@ -1462,7 +1462,7 @@ impl<'db> Type<'db> {
     /// Return true if this type is [assignable to] type `target`.
     ///
     /// [assignable to]: https://typing.python.org/en/latest/spec/concepts.html#the-assignable-to-or-consistent-subtyping-relation
-    pub(crate) fn is_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
+    pub fn is_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
         self.when_assignable_to(db, target).is_always_satisfied()
     }
 
