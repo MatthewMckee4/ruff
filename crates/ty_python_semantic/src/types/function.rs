@@ -670,7 +670,7 @@ impl<'db> FunctionLiteral<'db> {
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 #[derive(PartialOrd, Ord)]
 pub struct FunctionType<'db> {
-    pub(crate) literal: FunctionLiteral<'db>,
+    pub literal: FunctionLiteral<'db>,
 
     /// Contains a potentially modified signature for this function literal, in case certain operations
     /// (like type mappings) have been applied to it.
