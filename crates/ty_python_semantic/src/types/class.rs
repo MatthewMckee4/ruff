@@ -4303,7 +4303,7 @@ impl KnownClass {
     /// representing all possible instances of the class.
     ///
     /// If the class cannot be found in typeshed, a debug-level log message will be emitted stating this.
-    pub(crate) fn to_instance(self, db: &dyn Db) -> Type<'_> {
+    pub fn to_instance(self, db: &dyn Db) -> Type<'_> {
         self.to_class_literal(db)
             .to_class_type(db)
             .map(|class| Type::instance(db, class))
