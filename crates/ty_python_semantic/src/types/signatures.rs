@@ -283,7 +283,7 @@ pub struct Signature<'db> {
     parameters: Parameters<'db>,
 
     /// Annotated return type, if any.
-    pub(crate) return_ty: Option<Type<'db>>,
+    pub return_ty: Option<Type<'db>>,
 }
 
 pub(super) fn walk_signature<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
