@@ -670,7 +670,7 @@ impl<'db> FunctionLiteral<'db> {
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 #[derive(PartialOrd, Ord)]
 pub struct FunctionType<'db> {
-    pub literal: FunctionLiteral<'db>,
+    pub(crate) literal: FunctionLiteral<'db>,
 
     /// Contains a potentially modified signature for this function literal, in case certain operations
     /// (like type mappings) have been applied to it.
@@ -891,7 +891,7 @@ impl<'db> FunctionType<'db> {
 
     /// Returns all of the overload signatures and the implementation definition, if any, of this
     /// function. The overload signatures will be in source order.
-    pub(crate) fn overloads_and_implementation(
+    pub fn overloads_and_implementation(
         self,
         db: &'db dyn Db,
     ) -> &'db (Box<[OverloadLiteral<'db>]>, Option<OverloadLiteral<'db>>) {
