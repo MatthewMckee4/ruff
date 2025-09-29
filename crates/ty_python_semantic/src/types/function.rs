@@ -504,7 +504,7 @@ pub struct FunctionLiteral<'db> {
     ///
     /// [infer]: crate::types::infer::TypeInferenceBuilder::infer_function_definition
     /// [updated]: crate::types::class::ClassLiteral::own_class_member
-    inherited_generic_context: Option<GenericContext<'db>>,
+    pub inherited_generic_context: Option<GenericContext<'db>>,
 }
 
 // The Salsa heap is tracked separately.
