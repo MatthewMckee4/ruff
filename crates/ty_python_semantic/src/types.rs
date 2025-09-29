@@ -78,7 +78,7 @@ pub use special_form::SpecialFormType;
 
 mod builder;
 mod call;
-mod class;
+pub mod class;
 mod class_base;
 mod constraints;
 mod context;
