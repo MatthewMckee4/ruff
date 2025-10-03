@@ -67,7 +67,7 @@ const ITERATIONS_BEFORE_FALLBACK: u32 = 10;
 /// Use when checking a scope, or needing to provide a type for an arbitrary expression in the
 /// scope.
 #[salsa::tracked(returns(ref), cycle_fn=scope_cycle_recover, cycle_initial=scope_cycle_initial, heap_size=ruff_memory_usage::heap_size)]
-pub(crate) fn infer_scope_types<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> ScopeInference<'db> {
+pub fn infer_scope_types<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> ScopeInference<'db> {
     let file = scope.file(db);
     let _span = tracing::trace_span!("infer_scope_types", scope=?scope.as_id(), ?file).entered();
 
@@ -543,7 +543,7 @@ impl<'db> CycleRecovery<'db> {
 
 /// The inferred types for a scope region.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct ScopeInference<'db> {
+pub struct ScopeInference<'db> {
     /// The types of every expression in this region.
     expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
 
@@ -577,7 +577,7 @@ impl<'db> ScopeInference<'db> {
         self.extra.as_deref().map(|extra| &extra.diagnostics)
     }
 
-    pub(crate) fn expression_type(&self, expression: impl Into<ExpressionNodeKey>) -> Type<'db> {
+    pub fn expression_type(&self, expression: impl Into<ExpressionNodeKey>) -> Type<'db> {
         self.try_expression_type(expression)
             .unwrap_or_else(Type::unknown)
     }

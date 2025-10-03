@@ -52,7 +52,7 @@ pub(crate) use self::use_def::{
 ///
 /// Prefer using [`symbol_table`] when working with symbols from a single scope.
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size)]
-pub(crate) fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
+pub fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
     let _span = tracing::trace_span!("semantic_index", ?file).entered();
 
     let module = parsed_module(db, file).load(db);
@@ -196,7 +196,7 @@ pub(crate) enum EnclosingSnapshotResult<'map, 'db> {
 
 /// The place tables and use-def maps for all scopes in a file.
 #[derive(Debug, Update, get_size2::GetSize)]
-pub(crate) struct SemanticIndex<'db> {
+pub struct SemanticIndex<'db> {
     /// List of all place tables in this file, indexed by scope.
     place_tables: IndexVec<FileScopeId, Arc<PlaceTable>>,
 
@@ -269,7 +269,7 @@ impl<'db> SemanticIndex<'db> {
 
     /// Returns the ID of the `expression`'s enclosing scope.
     #[track_caller]
-    pub(crate) fn expression_scope_id<E>(&self, expression: &E) -> FileScopeId
+    pub fn expression_scope_id<E>(&self, expression: &E) -> FileScopeId
     where
         E: HasTrackedScope,
     {
