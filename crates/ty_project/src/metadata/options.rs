@@ -770,7 +770,7 @@ impl SrcOptions {
 pub struct Rules {
     #[cfg_attr(feature = "schemars", schemars(with = "schema::Rules"))]
     #[get_size(ignore)] // TODO: Add `GetSize` support for `OrderMap`.
-    inner: OrderMap<RangedValue<String>, RangedValue<Level>, BuildHasherDefault<FxHasher>>,
+    pub inner: OrderMap<RangedValue<String>, RangedValue<Level>, BuildHasherDefault<FxHasher>>,
 }
 
 impl FromIterator<(RangedValue<String>, RangedValue<Level>)> for Rules {
