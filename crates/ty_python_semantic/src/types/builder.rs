@@ -208,7 +208,7 @@ enum ReduceResult<'db> {
 // below 200, which is the salsa fixpoint iteration limit.
 const MAX_UNION_LITERALS: usize = 199;
 
-pub(crate) struct UnionBuilder<'db> {
+pub struct UnionBuilder<'db> {
     elements: Vec<UnionElement<'db>>,
     db: &'db dyn Db,
     unpack_aliases: bool,
