@@ -1639,7 +1639,7 @@ impl OptionDiagnostic {
         self
     }
 
-    pub(crate) fn to_diagnostic(&self) -> Diagnostic {
+    pub fn to_diagnostic(&self) -> Diagnostic {
         let mut diag = Diagnostic::new(self.id, self.severity, &self.message);
         if let Some(annotation) = self.annotation.clone() {
             diag.annotate(annotation);
