@@ -216,7 +216,7 @@ pub struct UnionBuilder<'db> {
 }
 
 impl<'db> UnionBuilder<'db> {
-    pub(crate) fn new(db: &'db dyn Db) -> Self {
+    pub fn new(db: &'db dyn Db) -> Self {
         Self {
             db,
             elements: vec![],
@@ -246,7 +246,7 @@ impl<'db> UnionBuilder<'db> {
     }
 
     /// Adds a type to this union.
-    pub(crate) fn add(mut self, ty: Type<'db>) -> Self {
+    pub fn add(mut self, ty: Type<'db>) -> Self {
         self.add_in_place(ty);
         self
     }
