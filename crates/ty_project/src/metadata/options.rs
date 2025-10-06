@@ -1629,7 +1629,7 @@ impl OptionDiagnostic {
     }
 
     #[must_use]
-    fn with_annotation(self, annotation: Option<Annotation>) -> Self {
+    pub fn with_annotation(self, annotation: Option<Annotation>) -> Self {
         OptionDiagnostic { annotation, ..self }
     }
 
