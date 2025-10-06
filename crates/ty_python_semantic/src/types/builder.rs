@@ -541,7 +541,7 @@ impl<'db> UnionBuilder<'db> {
         }
     }
 
-    pub(crate) fn build(self) -> Type<'db> {
+    pub fn build(self) -> Type<'db> {
         self.try_build().unwrap_or(Type::Never)
     }
 
