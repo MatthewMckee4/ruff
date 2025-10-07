@@ -128,6 +128,7 @@ pub enum ResolveRequiresPythonError {
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct Tool {
+    #[serde(alias = "unsoundness-checker")]
     pub ty: Option<Options>,
 }
 
