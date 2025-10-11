@@ -253,7 +253,7 @@ impl<'db> OverloadLiteral<'db> {
             )
     }
 
-    fn node<'ast>(
+    pub fn node<'ast>(
         self,
         db: &dyn Db,
         file: File,
