@@ -792,7 +792,7 @@ impl<'db> FunctionType<'db> {
         self.literal(db).known(db)
     }
 
-    pub(crate) fn is_known(self, db: &'db dyn Db, known_function: KnownFunction) -> bool {
+    pub fn is_known(self, db: &'db dyn Db, known_function: KnownFunction) -> bool {
         self.known(db) == Some(known_function)
     }
 
