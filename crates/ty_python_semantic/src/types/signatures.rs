@@ -1024,10 +1024,10 @@ impl<'db> Signature<'db> {
         Self { definition, ..self }
     }
 
-    pub fn default_types(&self) -> Vec<Type<'db>> {
+    pub fn parameter_annotated_types(&self) -> Vec<Option<Type<'db>>> {
         self.parameters
             .iter()
-            .filter_map(Parameter::default_type)
+            .map(Parameter::annotated_type)
             .collect()
     }
 }
