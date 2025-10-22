@@ -979,7 +979,7 @@ impl<T> Tuple<T> {
     }
 
     /// Returns an iterator of all of the fixed-length element types of this tuple.
-    pub(crate) fn fixed_elements(&self) -> impl Iterator<Item = &T> + '_ {
+    pub fn fixed_elements(&self) -> impl Iterator<Item = &T> + '_ {
         match self {
             Tuple::Fixed(tuple) => Either::Left(tuple.elements()),
             Tuple::Variable(tuple) => Either::Right(tuple.fixed_elements()),

@@ -792,7 +792,7 @@ impl<'db> Type<'db> {
         matches!(self, Type::Callable(..))
     }
 
-    fn is_none(&self, db: &'db dyn Db) -> bool {
+    pub fn is_none(&self, db: &'db dyn Db) -> bool {
         self.into_nominal_instance()
             .is_some_and(|instance| instance.has_known_class(db, KnownClass::NoneType))
     }
@@ -896,7 +896,7 @@ impl<'db> Type<'db> {
     ///
     /// I.e., for the type `tuple[int, str]`, this will return the tuple spec `[int, str]`.
     /// For a subclass of `tuple[int, str]`, it will return the same tuple spec.
-    fn tuple_instance_spec(&self, db: &'db dyn Db) -> Option<Cow<'db, TupleSpec<'db>>> {
+    pub fn tuple_instance_spec(&self, db: &'db dyn Db) -> Option<Cow<'db, TupleSpec<'db>>> {
         self.into_nominal_instance()
             .and_then(|instance| instance.tuple_spec(db))
     }
