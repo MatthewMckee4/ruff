@@ -1030,6 +1030,13 @@ impl<'db> Signature<'db> {
             .map(Parameter::annotated_type)
             .collect()
     }
+
+    pub fn parameter_default_types(&self) -> Vec<Option<Type<'db>>> {
+        self.parameters
+            .iter()
+            .map(Parameter::default_type)
+            .collect()
+    }
 }
 
 impl<'db> VarianceInferable<'db> for &Signature<'db> {
