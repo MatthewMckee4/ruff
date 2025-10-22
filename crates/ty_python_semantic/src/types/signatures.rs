@@ -1023,6 +1023,13 @@ impl<'db> Signature<'db> {
     pub(crate) fn with_definition(self, definition: Option<Definition<'db>>) -> Self {
         Self { definition, ..self }
     }
+
+    pub fn default_types(&self) -> Vec<Type<'db>> {
+        self.parameters
+            .iter()
+            .filter_map(Parameter::default_type)
+            .collect()
+    }
 }
 
 impl<'db> VarianceInferable<'db> for &Signature<'db> {
