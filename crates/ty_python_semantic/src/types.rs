@@ -1170,7 +1170,7 @@ impl<'db> Type<'db> {
     /// Note that this function tries to promote literals to a more user-friendly form than their
     /// fallback instance type. For example, `def _() -> int` is promoted to `Callable[[], int]`,
     /// as opposed to `FunctionType`.
-    pub(crate) fn literal_promotion_type(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    pub fn literal_promotion_type(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
             Type::StringLiteral(_) | Type::LiteralString => Some(KnownClass::Str.to_instance(db)),
             Type::BooleanLiteral(_) => Some(KnownClass::Bool.to_instance(db)),
