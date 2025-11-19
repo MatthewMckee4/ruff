@@ -990,7 +990,7 @@ impl<'db> Type<'db> {
     ///
     /// I.e., for the type `tuple[int, str]`, this will return the tuple spec `[int, str]`.
     /// For a subclass of `tuple[int, str]`, it will return the same tuple spec.
-    fn tuple_instance_spec(&self, db: &'db dyn Db) -> Option<Cow<'db, TupleSpec<'db>>> {
+    pub fn tuple_instance_spec(&self, db: &'db dyn Db) -> Option<Cow<'db, TupleSpec<'db>>> {
         self.as_nominal_instance()
             .and_then(|instance| instance.tuple_spec(db))
     }
