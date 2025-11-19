@@ -1342,7 +1342,7 @@ impl<'db> Type<'db> {
     /// as opposed to `FunctionType`.
     ///
     /// It also avoids literal promotion if a literal type annotation was provided as type context.
-    pub(crate) fn promote_literals(self, db: &'db dyn Db, tcx: TypeContext<'db>) -> Type<'db> {
+    pub fn promote_literals(self, db: &'db dyn Db, tcx: TypeContext<'db>) -> Type<'db> {
         self.apply_type_mapping(
             db,
             &TypeMapping::PromoteLiterals(PromoteLiteralsMode::On),
