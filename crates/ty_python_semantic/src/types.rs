@@ -8685,7 +8685,7 @@ impl get_size2::GetSize for TypeVarIdentity<'_> {}
 #[derive(PartialOrd, Ord)]
 pub struct TypeVarInstance<'db> {
     /// The identity of this typevar
-    pub(crate) identity: TypeVarIdentity<'db>,
+    pub identity: TypeVarIdentity<'db>,
 
     /// The upper bound or constraint on the type of this TypeVar, if any. Don't use this field
     /// directly; use the `bound_or_constraints` (or `upper_bound` and `constraints`) methods
