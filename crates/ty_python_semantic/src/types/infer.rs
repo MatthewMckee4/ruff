@@ -352,7 +352,7 @@ struct ExpressionWithContext<'db> {
 /// Knowing the outer type context when inferring an expression can enable
 /// more precise inference results, aka "bidirectional type inference".
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
-pub(crate) struct TypeContext<'db> {
+pub struct TypeContext<'db> {
     pub(crate) annotation: Option<Type<'db>>,
 }
 
