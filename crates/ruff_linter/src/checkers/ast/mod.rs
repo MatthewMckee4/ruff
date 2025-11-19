@@ -73,7 +73,8 @@ use crate::rules::pyflakes::rules::{
     UndefinedLocalWithNestedImportStarUsage, YieldOutsideFunction,
 };
 use crate::rules::pylint::rules::{
-    AwaitOutsideAsync, LoadBeforeGlobalDeclaration, YieldFromInAsyncFunction,
+    AwaitOutsideAsync, LoadBeforeGlobalDeclaration, NonlocalWithoutBinding,
+    YieldFromInAsyncFunction,
 };
 use crate::rules::{flake8_pyi, flake8_type_checking, pyflakes, pyupgrade};
 use crate::settings::rule_table::RuleTable;
@@ -641,6 +642,10 @@ impl SemanticSyntaxContext for Checker<'_> {
         self.semantic.global(name)
     }
 
+    fn has_nonlocal_binding(&self, name: &str) -> bool {
+        self.semantic.nonlocal(name).is_some()
+    }
+
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         match error.kind {
             SemanticSyntaxErrorKind::LateFutureImport => {
@@ -697,11 +702,30 @@ impl SemanticSyntaxContext for Checker<'_> {
                 }
             }
             SemanticSyntaxErrorKind::FutureFeatureNotDefined(name) => {
+                // F407
                 if self.is_rule_enabled(Rule::FutureFeatureNotDefined) {
                     self.report_diagnostic(
                         pyflakes::rules::FutureFeatureNotDefined { name },
                         error.range,
                     );
+                }
+            }
+            SemanticSyntaxErrorKind::BreakOutsideLoop => {
+                // F701
+                if self.is_rule_enabled(Rule::BreakOutsideLoop) {
+                    self.report_diagnostic(pyflakes::rules::BreakOutsideLoop, error.range);
+                }
+            }
+            SemanticSyntaxErrorKind::ContinueOutsideLoop => {
+                // F702
+                if self.is_rule_enabled(Rule::ContinueOutsideLoop) {
+                    self.report_diagnostic(pyflakes::rules::ContinueOutsideLoop, error.range);
+                }
+            }
+            SemanticSyntaxErrorKind::NonlocalWithoutBinding(name) => {
+                // PLE0117
+                if self.is_rule_enabled(Rule::NonlocalWithoutBinding) {
+                    self.report_diagnostic(NonlocalWithoutBinding { name }, error.range);
                 }
             }
             SemanticSyntaxErrorKind::ReboundComprehensionVariable
@@ -710,7 +734,9 @@ impl SemanticSyntaxContext for Checker<'_> {
             | SemanticSyntaxErrorKind::IrrefutableCasePattern(_)
             | SemanticSyntaxErrorKind::SingleStarredAssignment
             | SemanticSyntaxErrorKind::WriteToDebug(_)
+            | SemanticSyntaxErrorKind::DifferentMatchPatternBindings
             | SemanticSyntaxErrorKind::InvalidExpression(..)
+            | SemanticSyntaxErrorKind::GlobalParameter(_)
             | SemanticSyntaxErrorKind::DuplicateMatchKey(_)
             | SemanticSyntaxErrorKind::DuplicateMatchClassAttribute(_)
             | SemanticSyntaxErrorKind::InvalidStarExpression
@@ -811,18 +837,53 @@ impl SemanticSyntaxContext for Checker<'_> {
             }
         )
     }
+
+    fn in_loop_context(&self) -> bool {
+        let mut child = self.semantic.current_statement();
+
+        for parent in self.semantic.current_statements().skip(1) {
+            match parent {
+                Stmt::For(ast::StmtFor { orelse, .. })
+                | Stmt::While(ast::StmtWhile { orelse, .. }) => {
+                    if !orelse.contains(child) {
+                        return true;
+                    }
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
+                    break;
+                }
+                _ => {}
+            }
+            child = parent;
+        }
+        false
+    }
+
+    fn is_bound_parameter(&self, name: &str) -> bool {
+        match self.semantic.current_scope().kind {
+            ScopeKind::Function(ast::StmtFunctionDef { parameters, .. }) => {
+                parameters.includes(name)
+            }
+            ScopeKind::Class(_)
+            | ScopeKind::Lambda(_)
+            | ScopeKind::Generator { .. }
+            | ScopeKind::Module
+            | ScopeKind::Type
+            | ScopeKind::DunderClassCell => false,
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        // Step 0: Pre-processing
+        self.semantic.push_node(stmt);
+
         // For functions, defer semantic syntax error checks until the body of the function is
         // visited
         if !stmt.is_function_def_stmt() {
             self.with_semantic_checker(|semantic, context| semantic.visit_stmt(stmt, context));
         }
-
-        // Step 0: Pre-processing
-        self.semantic.push_node(stmt);
 
         // For Jupyter Notebooks, we'll reset the `IMPORT_BOUNDARY` flag when
         // we encounter a cell boundary.
@@ -1342,6 +1403,14 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.target_version(),
                 ) {
                     AnnotationContext::RuntimeRequired => {
+                        self.visit_runtime_required_annotation(annotation);
+                    }
+                    AnnotationContext::RuntimeEvaluated
+                        if flake8_type_checking::helpers::is_dataclass_meta_annotation(
+                            annotation,
+                            self.semantic(),
+                        ) =>
+                    {
                         self.visit_runtime_required_annotation(annotation);
                     }
                     AnnotationContext::RuntimeEvaluated => {
@@ -2060,7 +2129,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             | Expr::DictComp(_)
             | Expr::SetComp(_) => {
                 self.analyze.scopes.push(self.semantic.scope_id);
-                self.semantic.pop_scope();
+                self.semantic.pop_scope(); // Lambda/Generator/Comprehension scope
             }
             _ => {}
         }
@@ -2985,7 +3054,35 @@ impl<'a> Checker<'a> {
                 if let Some(parameters) = parameters {
                     self.visit_parameters(parameters);
                 }
+
+                // Here we add the implicit scope surrounding a lambda which allows code in the
+                // lambda to access `__class__` at runtime when the lambda is defined within a class.
+                // See the `ScopeKind::DunderClassCell` docs for more information.
+                let added_dunder_class_scope = if self
+                    .semantic
+                    .current_scopes()
+                    .any(|scope| scope.kind.is_class())
+                {
+                    self.semantic.push_scope(ScopeKind::DunderClassCell);
+                    let binding_id = self.semantic.push_binding(
+                        TextRange::default(),
+                        BindingKind::DunderClassCell,
+                        BindingFlags::empty(),
+                    );
+                    self.semantic
+                        .current_scope_mut()
+                        .add("__class__", binding_id);
+                    true
+                } else {
+                    false
+                };
+
                 self.visit_expr(body);
+
+                // Pop the DunderClassCell scope if it was added
+                if added_dunder_class_scope {
+                    self.semantic.pop_scope();
+                }
             }
         }
         self.semantic.restore(snapshot);

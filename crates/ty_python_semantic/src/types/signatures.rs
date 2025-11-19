@@ -13,19 +13,107 @@
 use std::{collections::HashMap, slice::Iter};
 
 use itertools::{EitherOrBoth, Itertools};
+use ruff_db::parsed::parsed_module;
+use ruff_python_ast::ParameterWithDefault;
 use smallvec::{SmallVec, smallvec_inline};
 
-use super::{DynamicType, Type, TypeVarVariance, definition_expression_type};
-use crate::semantic_index::definition::Definition;
+use super::{
+    DynamicType, Type, TypeVarVariance, definition_expression_type, infer_definition_types,
+    semantic_index,
+};
+use crate::semantic_index::definition::{Definition, DefinitionKind};
 use crate::types::constraints::{ConstraintSet, IteratorConstraintsExtension};
-use crate::types::generics::{GenericContext, walk_generic_context};
+use crate::types::function::{is_implicit_classmethod, is_implicit_staticmethod};
+use crate::types::generics::{
+    GenericContext, InferableTypeVars, typing_self, walk_generic_context,
+};
+use crate::types::infer::nearest_enclosing_class;
 use crate::types::{
-    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, FindLegacyTypeVarsVisitor,
-    HasRelationToVisitor, IsEquivalentVisitor, KnownClass, MaterializationKind, NormalizedVisitor,
-    TypeMapping, TypeRelation, VarianceInferable, todo_type,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, ClassLiteral, FindLegacyTypeVarsVisitor,
+    HasRelationToVisitor, IsDisjointVisitor, IsEquivalentVisitor, KnownClass, MaterializationKind,
+    NormalizedVisitor, TypeContext, TypeMapping, TypeRelation, VarianceInferable, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_python_ast::{self as ast, name::Name};
+
+#[derive(Clone, Copy, Debug)]
+#[expect(clippy::struct_excessive_bools)]
+struct MethodInformation<'db> {
+    is_staticmethod: bool,
+    is_classmethod: bool,
+    method_may_be_generic: bool,
+    class_literal: ClassLiteral<'db>,
+    class_is_generic: bool,
+}
+
+fn infer_method_information<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<MethodInformation<'db>> {
+    let DefinitionKind::Function(function_definition) = definition.kind(db) else {
+        return None;
+    };
+
+    let class_scope_id = definition.scope(db);
+    let file = class_scope_id.file(db);
+    let module = parsed_module(db, file).load(db);
+    let index = semantic_index(db, file);
+
+    let class_scope = index.scope(class_scope_id.file_scope_id(db));
+    let class_node = class_scope.node().as_class()?;
+
+    let function_node = function_definition.node(&module);
+    let function_name = &function_node.name;
+
+    let mut is_staticmethod = is_implicit_classmethod(function_name);
+    let mut is_classmethod = is_implicit_staticmethod(function_name);
+
+    let inference = infer_definition_types(db, definition);
+    for decorator in &function_node.decorator_list {
+        let decorator_ty = inference.expression_type(&decorator.expression);
+
+        match decorator_ty
+            .as_class_literal()
+            .and_then(|class| class.known(db))
+        {
+            Some(KnownClass::Staticmethod) => {
+                is_staticmethod = true;
+            }
+            Some(KnownClass::Classmethod) => {
+                is_classmethod = true;
+            }
+            _ => {}
+        }
+    }
+
+    let method_may_be_generic = match inference.declaration_type(definition).inner_type() {
+        Type::FunctionLiteral(f) => f.signature(db).overloads.iter().any(|s| {
+            s.generic_context
+                .is_some_and(|context| context.variables(db).any(|v| v.typevar(db).is_self(db)))
+        }),
+        _ => true,
+    };
+
+    let class_def = index.expect_single_definition(class_node);
+    let (class_literal, class_is_generic) = match infer_definition_types(db, class_def)
+        .declaration_type(class_def)
+        .inner_type()
+    {
+        Type::ClassLiteral(class_literal) => {
+            (class_literal, class_literal.generic_context(db).is_some())
+        }
+        Type::GenericAlias(alias) => (alias.origin(db), true),
+        _ => return None,
+    };
+
+    Some(MethodInformation {
+        is_staticmethod,
+        is_classmethod,
+        method_may_be_generic,
+        class_literal,
+        class_is_generic,
+    })
+}
 
 /// The signature of a single callable. If the callable is overloaded, there is a separate
 /// [`Signature`] for each overload.
@@ -64,12 +152,13 @@ impl<'db> CallableSignature<'db> {
 
     pub(crate) fn with_inherited_generic_context(
         &self,
-        inherited_generic_context: Option<GenericContext<'db>>,
+        db: &'db dyn Db,
+        inherited_generic_context: GenericContext<'db>,
     ) -> Self {
         Self::from_overloads(self.overloads.iter().map(|signature| {
             signature
                 .clone()
-                .with_inherited_generic_context(inherited_generic_context)
+                .with_inherited_generic_context(db, inherited_generic_context)
         }))
     }
 
@@ -89,12 +178,13 @@ impl<'db> CallableSignature<'db> {
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
         Self::from_overloads(
             self.overloads
                 .iter()
-                .map(|signature| signature.apply_type_mapping_impl(db, type_mapping, visitor)),
+                .map(|signature| signature.apply_type_mapping_impl(db, type_mapping, tcx, visitor)),
         )
     }
 
@@ -123,43 +213,40 @@ impl<'db> CallableSignature<'db> {
         }
     }
 
-    /// Check whether this callable type is a subtype of another callable type.
-    ///
-    /// See [`Type::is_subtype_of`] for more details.
-    pub(crate) fn is_subtype_of(&self, db: &'db dyn Db, other: &Self) -> bool {
-        self.is_subtype_of_impl(db, other).is_always_satisfied()
-    }
-
-    fn is_subtype_of_impl(&self, db: &'db dyn Db, other: &Self) -> ConstraintSet<'db> {
+    fn is_subtype_of_impl(
+        &self,
+        db: &'db dyn Db,
+        other: &Self,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
         self.has_relation_to_impl(
             db,
             other,
+            inferable,
             TypeRelation::Subtyping,
             &HasRelationToVisitor::default(),
+            &IsDisjointVisitor::default(),
         )
-    }
-
-    /// Check whether this callable type is assignable to another callable type.
-    ///
-    /// See [`Type::is_assignable_to`] for more details.
-    pub(crate) fn is_assignable_to(&self, db: &'db dyn Db, other: &Self) -> bool {
-        self.has_relation_to_impl(
-            db,
-            other,
-            TypeRelation::Assignability,
-            &HasRelationToVisitor::default(),
-        )
-        .is_always_satisfied()
     }
 
     pub(crate) fn has_relation_to_impl(
         &self,
         db: &'db dyn Db,
         other: &Self,
-        relation: TypeRelation,
-        visitor: &HasRelationToVisitor<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+        relation: TypeRelation<'db>,
+        relation_visitor: &HasRelationToVisitor<'db>,
+        disjointness_visitor: &IsDisjointVisitor<'db>,
     ) -> ConstraintSet<'db> {
-        Self::has_relation_to_inner(db, &self.overloads, &other.overloads, relation, visitor)
+        Self::has_relation_to_inner(
+            db,
+            &self.overloads,
+            &other.overloads,
+            inferable,
+            relation,
+            relation_visitor,
+            disjointness_visitor,
+        )
     }
 
     /// Implementation of subtyping and assignability between two, possible overloaded, callable
@@ -168,13 +255,22 @@ impl<'db> CallableSignature<'db> {
         db: &'db dyn Db,
         self_signatures: &[Signature<'db>],
         other_signatures: &[Signature<'db>],
-        relation: TypeRelation,
-        visitor: &HasRelationToVisitor<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+        relation: TypeRelation<'db>,
+        relation_visitor: &HasRelationToVisitor<'db>,
+        disjointness_visitor: &IsDisjointVisitor<'db>,
     ) -> ConstraintSet<'db> {
         match (self_signatures, other_signatures) {
             ([self_signature], [other_signature]) => {
                 // Base case: both callable types contain a single signature.
-                self_signature.has_relation_to_impl(db, other_signature, relation, visitor)
+                self_signature.has_relation_to_impl(
+                    db,
+                    other_signature,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
             }
 
             // `self` is possibly overloaded while `other` is definitely not overloaded.
@@ -183,8 +279,10 @@ impl<'db> CallableSignature<'db> {
                     db,
                     std::slice::from_ref(self_signature),
                     other_signatures,
+                    inferable,
                     relation,
-                    visitor,
+                    relation_visitor,
+                    disjointness_visitor,
                 )
             }),
 
@@ -194,8 +292,10 @@ impl<'db> CallableSignature<'db> {
                     db,
                     self_signatures,
                     std::slice::from_ref(other_signature),
+                    inferable,
                     relation,
-                    visitor,
+                    relation_visitor,
+                    disjointness_visitor,
                 )
             }),
 
@@ -205,8 +305,10 @@ impl<'db> CallableSignature<'db> {
                     db,
                     self_signatures,
                     std::slice::from_ref(other_signature),
+                    inferable,
                     relation,
-                    visitor,
+                    relation_visitor,
+                    disjointness_visitor,
                 )
             }),
         }
@@ -219,20 +321,21 @@ impl<'db> CallableSignature<'db> {
         &self,
         db: &'db dyn Db,
         other: &Self,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         match (self.overloads.as_slice(), other.overloads.as_slice()) {
             ([self_signature], [other_signature]) => {
                 // Common case: both callable types contain a single signature, use the custom
                 // equivalence check instead of delegating it to the subtype check.
-                self_signature.is_equivalent_to_impl(db, other_signature, visitor)
+                self_signature.is_equivalent_to_impl(db, other_signature, inferable, visitor)
             }
             (_, _) => {
                 if self == other {
                     return ConstraintSet::from(true);
                 }
-                self.is_subtype_of_impl(db, other)
-                    .and(db, || other.is_subtype_of_impl(db, self))
+                self.is_subtype_of_impl(db, other, inferable)
+                    .and(db, || other.is_subtype_of_impl(db, self, inferable))
             }
         }
     }
@@ -263,11 +366,6 @@ pub struct Signature<'db> {
     /// The generic context for this overload, if it is generic.
     pub(crate) generic_context: Option<GenericContext<'db>>,
 
-    /// The inherited generic context, if this function is a class method being used to infer the
-    /// specialization of its generic class. If the method is itself generic, this is in addition
-    /// to its own generic context.
-    pub(crate) inherited_generic_context: Option<GenericContext<'db>>,
-
     /// The original definition associated with this function, if available.
     /// This is useful for locating and extracting docstring information for the signature.
     pub(crate) definition: Option<Definition<'db>>,
@@ -294,9 +392,6 @@ pub(super) fn walk_signature<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
     if let Some(generic_context) = &signature.generic_context {
         walk_generic_context(db, *generic_context, visitor);
     }
-    if let Some(inherited_generic_context) = &signature.inherited_generic_context {
-        walk_generic_context(db, *inherited_generic_context, visitor);
-    }
     // By default we usually don't visit the type of the default value,
     // as it isn't relevant to most things
     for parameter in &signature.parameters {
@@ -313,7 +408,6 @@ impl<'db> Signature<'db> {
     pub(crate) fn new(parameters: Parameters<'db>, return_ty: Option<Type<'db>>) -> Self {
         Self {
             generic_context: None,
-            inherited_generic_context: None,
             definition: None,
             parameters,
             return_ty,
@@ -327,7 +421,6 @@ impl<'db> Signature<'db> {
     ) -> Self {
         Self {
             generic_context,
-            inherited_generic_context: None,
             definition: None,
             parameters,
             return_ty,
@@ -338,7 +431,6 @@ impl<'db> Signature<'db> {
     pub(crate) fn dynamic(signature_type: Type<'db>) -> Self {
         Signature {
             generic_context: None,
-            inherited_generic_context: None,
             definition: None,
             parameters: Parameters::gradual_form(),
             return_ty: Some(signature_type),
@@ -351,7 +443,6 @@ impl<'db> Signature<'db> {
         let signature_type = todo_type!(reason);
         Signature {
             generic_context: None,
-            inherited_generic_context: None,
             definition: None,
             parameters: Parameters::todo(),
             return_ty: Some(signature_type),
@@ -361,11 +452,9 @@ impl<'db> Signature<'db> {
     /// Return a typed signature from a function definition.
     pub(super) fn from_function(
         db: &'db dyn Db,
-        generic_context: Option<GenericContext<'db>>,
-        inherited_generic_context: Option<GenericContext<'db>>,
+        pep695_generic_context: Option<GenericContext<'db>>,
         definition: Definition<'db>,
         function_node: &ast::StmtFunctionDef,
-        is_generator: bool,
         has_implicitly_positional_first_parameter: bool,
     ) -> Self {
         let parameters = Parameters::from_parameters(
@@ -374,48 +463,32 @@ impl<'db> Signature<'db> {
             function_node.parameters.as_ref(),
             has_implicitly_positional_first_parameter,
         );
-        let return_ty = function_node.returns.as_ref().map(|returns| {
-            let plain_return_ty = definition_expression_type(db, definition, returns.as_ref())
-                .apply_type_mapping(
-                    db,
-                    &TypeMapping::MarkTypeVarsInferable(Some(BindingContext::Definition(
-                        definition,
-                    ))),
-                );
-            if function_node.is_async && !is_generator {
-                KnownClass::CoroutineType
-                    .to_specialized_instance(db, [Type::any(), Type::any(), plain_return_ty])
-            } else {
-                plain_return_ty
-            }
-        });
+        let return_ty = function_node
+            .returns
+            .as_ref()
+            .map(|returns| definition_expression_type(db, definition, returns.as_ref()));
         let legacy_generic_context =
             GenericContext::from_function_params(db, definition, &parameters, return_ty);
-
-        let full_generic_context = match (legacy_generic_context, generic_context) {
-            (Some(legacy_ctx), Some(ctx)) => {
-                if legacy_ctx
-                    .variables(db)
-                    .iter()
-                    .exactly_one()
-                    .is_ok_and(|bound_typevar| bound_typevar.typevar(db).is_self(db))
-                {
-                    Some(legacy_ctx.merge(db, ctx))
-                } else {
-                    // TODO: Raise a diagnostic — mixing PEP 695 and legacy typevars is not allowed
-                    Some(ctx)
-                }
-            }
-            (left, right) => left.or(right),
-        };
+        let full_generic_context = GenericContext::merge_pep695_and_legacy(
+            db,
+            pep695_generic_context,
+            legacy_generic_context,
+        );
 
         Self {
             generic_context: full_generic_context,
-            inherited_generic_context,
             definition: Some(definition),
             parameters,
             return_ty,
         }
+    }
+
+    pub(super) fn wrap_coroutine_return_type(self, db: &'db dyn Db) -> Self {
+        let return_ty = self.return_ty.map(|return_ty| {
+            KnownClass::CoroutineType
+                .to_specialized_instance(db, [Type::any(), Type::any(), return_ty])
+        });
+        Self { return_ty, ..self }
     }
 
     /// Returns the signature which accepts any parameters and returns an `Unknown` type.
@@ -430,9 +503,17 @@ impl<'db> Signature<'db> {
 
     pub(crate) fn with_inherited_generic_context(
         mut self,
-        inherited_generic_context: Option<GenericContext<'db>>,
+        db: &'db dyn Db,
+        inherited_generic_context: GenericContext<'db>,
     ) -> Self {
-        self.inherited_generic_context = inherited_generic_context;
+        match self.generic_context.as_mut() {
+            Some(generic_context) => {
+                *generic_context = generic_context.merge(db, inherited_generic_context);
+            }
+            None => {
+                self.generic_context = Some(inherited_generic_context);
+            }
+        }
         self
     }
 
@@ -444,9 +525,6 @@ impl<'db> Signature<'db> {
         Self {
             generic_context: self
                 .generic_context
-                .map(|ctx| ctx.normalized_impl(db, visitor)),
-            inherited_generic_context: self
-                .inherited_generic_context
                 .map(|ctx| ctx.normalized_impl(db, visitor)),
             // Discard the definition when normalizing, so that two equivalent signatures
             // with different `Definition`s share the same Salsa ID when normalized
@@ -466,26 +544,23 @@ impl<'db> Signature<'db> {
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
-        let flipped_mapping = match type_mapping {
-            TypeMapping::Materialize(materialization_kind) => {
-                &TypeMapping::Materialize(materialization_kind.flip())
-            }
-            _ => type_mapping,
-        };
         Self {
             generic_context: self
                 .generic_context
                 .map(|context| type_mapping.update_signature_generic_context(db, context)),
-            inherited_generic_context: self.inherited_generic_context,
             definition: self.definition,
-            parameters: self
-                .parameters
-                .apply_type_mapping_impl(db, flipped_mapping, visitor),
+            parameters: self.parameters.apply_type_mapping_impl(
+                db,
+                &type_mapping.flip(),
+                tcx,
+                visitor,
+            ),
             return_ty: self
                 .return_ty
-                .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, visitor)),
+                .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor)),
         }
     }
 
@@ -520,23 +595,43 @@ impl<'db> Signature<'db> {
     }
 
     pub(crate) fn bind_self(&self, db: &'db dyn Db, self_type: Option<Type<'db>>) -> Self {
-        let mut parameters = Parameters::new(self.parameters().iter().skip(1).cloned());
+        let mut parameters = self.parameters.iter().cloned().peekable();
+
+        // TODO: Theoretically, for a signature like `f(*args: *tuple[MyClass, int, *tuple[str, ...]])` with
+        // a variadic first parameter, we should also "skip the first parameter" by modifying the tuple type.
+        if parameters.peek().is_some_and(Parameter::is_positional) {
+            parameters.next();
+        }
+
+        let mut parameters = Parameters::new(parameters);
         let mut return_ty = self.return_ty;
         if let Some(self_type) = self_type {
             parameters = parameters.apply_type_mapping_impl(
                 db,
                 &TypeMapping::BindSelf(self_type),
+                TypeContext::default(),
                 &ApplyTypeMappingVisitor::default(),
             );
-            return_ty =
-                return_ty.map(|ty| ty.apply_type_mapping(db, &TypeMapping::BindSelf(self_type)));
+            return_ty = return_ty.map(|ty| {
+                ty.apply_type_mapping(
+                    db,
+                    &TypeMapping::BindSelf(self_type),
+                    TypeContext::default(),
+                )
+            });
         }
         Self {
             generic_context: self.generic_context,
-            inherited_generic_context: self.inherited_generic_context,
             definition: self.definition,
             parameters,
             return_ty,
+        }
+    }
+
+    fn inferable_typevars(&self, db: &'db dyn Db) -> InferableTypeVars<'db, 'db> {
+        match self.generic_context {
+            Some(generic_context) => generic_context.inferable_typevars(db),
+            None => InferableTypeVars::None,
         }
     }
 
@@ -547,6 +642,41 @@ impl<'db> Signature<'db> {
         &self,
         db: &'db dyn Db,
         other: &Signature<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+        visitor: &IsEquivalentVisitor<'db>,
+    ) -> ConstraintSet<'db> {
+        // If either signature is generic, their typevars should also be considered inferable when
+        // checking whether the signatures are equivalent, since we only need to find one
+        // specialization that causes the check to succeed.
+        //
+        // TODO: We should alpha-rename these typevars, too, to correctly handle when a generic
+        // callable refers to typevars from within the context that defines them. This primarily
+        // comes up when referring to a generic function recursively from within its body:
+        //
+        //     def identity[T](t: T) -> T:
+        //         # Here, TypeOf[identity2] is a generic callable that should consider T to be
+        //         # inferable, even though other uses of T in the function body are non-inferable.
+        //         return t
+        let self_inferable = self.inferable_typevars(db);
+        let other_inferable = other.inferable_typevars(db);
+        let inferable = inferable.merge(&self_inferable);
+        let inferable = inferable.merge(&other_inferable);
+
+        // `inner` will create a constraint set that references these newly inferable typevars.
+        let when = self.is_equivalent_to_inner(db, other, inferable, visitor);
+
+        // But the caller does not need to consider those extra typevars. Whatever constraint set
+        // we produce, we reduce it back down to the inferable set that the caller asked about.
+        // If we introduced new inferable typevars, those will be existentially quantified away
+        // before returning.
+        when.reduce_inferable(db, self_inferable.iter().chain(other_inferable.iter()))
+    }
+
+    fn is_equivalent_to_inner(
+        &self,
+        db: &'db dyn Db,
+        other: &Signature<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         let mut result = ConstraintSet::from(true);
@@ -554,8 +684,11 @@ impl<'db> Signature<'db> {
             let self_type = self_type.unwrap_or(Type::unknown());
             let other_type = other_type.unwrap_or(Type::unknown());
             !result
-                .intersect(db, self_type.is_equivalent_to_impl(db, other_type, visitor))
-                .is_never_satisfied()
+                .intersect(
+                    db,
+                    self_type.is_equivalent_to_impl(db, other_type, inferable, visitor),
+                )
+                .is_never_satisfied(db)
         };
 
         if self.parameters.is_gradual() != other.parameters.is_gradual() {
@@ -630,8 +763,53 @@ impl<'db> Signature<'db> {
         &self,
         db: &'db dyn Db,
         other: &Signature<'db>,
-        relation: TypeRelation,
-        visitor: &HasRelationToVisitor<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+        relation: TypeRelation<'db>,
+        relation_visitor: &HasRelationToVisitor<'db>,
+        disjointness_visitor: &IsDisjointVisitor<'db>,
+    ) -> ConstraintSet<'db> {
+        // If either signature is generic, their typevars should also be considered inferable when
+        // checking whether one signature is a subtype/etc of the other, since we only need to find
+        // one specialization that causes the check to succeed.
+        //
+        // TODO: We should alpha-rename these typevars, too, to correctly handle when a generic
+        // callable refers to typevars from within the context that defines them. This primarily
+        // comes up when referring to a generic function recursively from within its body:
+        //
+        //     def identity[T](t: T) -> T:
+        //         # Here, TypeOf[identity2] is a generic callable that should consider T to be
+        //         # inferable, even though other uses of T in the function body are non-inferable.
+        //         return t
+        let self_inferable = self.inferable_typevars(db);
+        let other_inferable = other.inferable_typevars(db);
+        let inferable = inferable.merge(&self_inferable);
+        let inferable = inferable.merge(&other_inferable);
+
+        // `inner` will create a constraint set that references these newly inferable typevars.
+        let when = self.has_relation_to_inner(
+            db,
+            other,
+            inferable,
+            relation,
+            relation_visitor,
+            disjointness_visitor,
+        );
+
+        // But the caller does not need to consider those extra typevars. Whatever constraint set
+        // we produce, we reduce it back down to the inferable set that the caller asked about.
+        // If we introduced new inferable typevars, those will be existentially quantified away
+        // before returning.
+        when.reduce_inferable(db, self_inferable.iter().chain(other_inferable.iter()))
+    }
+
+    fn has_relation_to_inner(
+        &self,
+        db: &'db dyn Db,
+        other: &Signature<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+        relation: TypeRelation<'db>,
+        relation_visitor: &HasRelationToVisitor<'db>,
+        disjointness_visitor: &IsDisjointVisitor<'db>,
     ) -> ConstraintSet<'db> {
         /// A helper struct to zip two slices of parameters together that provides control over the
         /// two iterators individually. It also keeps track of the current parameter in each
@@ -699,8 +877,18 @@ impl<'db> Signature<'db> {
             let type1 = type1.unwrap_or(Type::unknown());
             let type2 = type2.unwrap_or(Type::unknown());
             !result
-                .intersect(db, type1.has_relation_to_impl(db, type2, relation, visitor))
-                .is_never_satisfied()
+                .intersect(
+                    db,
+                    type1.has_relation_to_impl(
+                        db,
+                        type2,
+                        inferable,
+                        relation,
+                        relation_visitor,
+                        disjointness_visitor,
+                    ),
+                )
+                .is_never_satisfied(db)
         };
 
         // Return types are covariant.
@@ -1041,7 +1229,7 @@ impl<'db> Signature<'db> {
 
 impl<'db> VarianceInferable<'db> for &Signature<'db> {
     fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
-        tracing::debug!(
+        tracing::trace!(
             "Checking variance of `{tvar}` in `{self:?}`",
             tvar = typevar.typevar(db).name(db)
         );
@@ -1194,21 +1382,74 @@ impl<'db> Parameters<'db> {
         } = parameters;
 
         let default_type = |param: &ast::ParameterWithDefault| {
-            param
-                .default()
-                .map(|default| definition_expression_type(db, definition, default))
+            param.default().map(|default| {
+                definition_expression_type(db, definition, default).replace_parameter_defaults(db)
+            })
+        };
+
+        let method_info = infer_method_information(db, definition);
+        let is_static_or_classmethod =
+            method_info.is_some_and(|f| f.is_staticmethod || f.is_classmethod);
+
+        let inferred_annotation = |arg: &ParameterWithDefault| {
+            if let Some(MethodInformation {
+                method_may_be_generic,
+                class_literal,
+                class_is_generic,
+                ..
+            }) = method_info
+                && !is_static_or_classmethod
+                && arg.parameter.annotation().is_none()
+                && parameters.index(arg.name().id()) == Some(0)
+            {
+                if method_may_be_generic
+                    || class_is_generic
+                    || class_literal
+                        .known(db)
+                        .is_some_and(KnownClass::is_fallback_class)
+                {
+                    let scope_id = definition.scope(db);
+                    let typevar_binding_context = Some(definition);
+                    let index = semantic_index(db, scope_id.file(db));
+                    let class = nearest_enclosing_class(db, index, scope_id).unwrap();
+
+                    Some(
+                        typing_self(db, scope_id, typevar_binding_context, class)
+                            .expect("We should always find the surrounding class for an implicit self: Self annotation"),
+                    )
+                } else {
+                    // For methods of non-generic classes that are not otherwise generic (e.g. return `Self` or
+                    // have additional type parameters), the implicit `Self` type of the `self` parameter would
+                    // be the only type variable, so we can just use the class directly.
+                    Some(class_literal.to_non_generic_instance(db))
+                }
+            } else {
+                None
+            }
         };
 
         let pos_only_param = |param: &ast::ParameterWithDefault| {
-            Parameter::from_node_and_kind(
-                db,
-                definition,
-                &param.parameter,
-                ParameterKind::PositionalOnly {
-                    name: Some(param.parameter.name.id.clone()),
-                    default_type: default_type(param),
-                },
-            )
+            if let Some(inferred_annotation_type) = inferred_annotation(param) {
+                Parameter {
+                    annotated_type: Some(inferred_annotation_type),
+                    inferred_annotation: true,
+                    kind: ParameterKind::PositionalOnly {
+                        name: Some(param.parameter.name.id.clone()),
+                        default_type: default_type(param),
+                    },
+                    form: ParameterForm::Value,
+                }
+            } else {
+                Parameter::from_node_and_kind(
+                    db,
+                    definition,
+                    &param.parameter,
+                    ParameterKind::PositionalOnly {
+                        name: Some(param.parameter.name.id.clone()),
+                        default_type: default_type(param),
+                    },
+                )
+            }
         };
 
         let mut positional_only: Vec<Parameter> = posonlyargs.iter().map(pos_only_param).collect();
@@ -1232,15 +1473,27 @@ impl<'db> Parameters<'db> {
         }
 
         let positional_or_keyword = pos_or_keyword_iter.map(|arg| {
-            Parameter::from_node_and_kind(
-                db,
-                definition,
-                &arg.parameter,
-                ParameterKind::PositionalOrKeyword {
-                    name: arg.parameter.name.id.clone(),
-                    default_type: default_type(arg),
-                },
-            )
+            if let Some(inferred_annotation_type) = inferred_annotation(arg) {
+                Parameter {
+                    annotated_type: Some(inferred_annotation_type),
+                    inferred_annotation: true,
+                    kind: ParameterKind::PositionalOrKeyword {
+                        name: arg.parameter.name.id.clone(),
+                        default_type: default_type(arg),
+                    },
+                    form: ParameterForm::Value,
+                }
+            } else {
+                Parameter::from_node_and_kind(
+                    db,
+                    definition,
+                    &arg.parameter,
+                    ParameterKind::PositionalOrKeyword {
+                        name: arg.parameter.name.id.clone(),
+                        default_type: default_type(arg),
+                    },
+                )
+            }
         });
 
         let variadic = vararg.as_ref().map(|arg| {
@@ -1291,6 +1544,7 @@ impl<'db> Parameters<'db> {
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
         match type_mapping {
@@ -1310,7 +1564,7 @@ impl<'db> Parameters<'db> {
                 value: self
                     .value
                     .iter()
-                    .map(|param| param.apply_type_mapping_impl(db, type_mapping, visitor))
+                    .map(|param| param.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
                     .collect(),
                 is_gradual: self.is_gradual,
             },
@@ -1413,6 +1667,10 @@ pub(crate) struct Parameter<'db> {
     /// Annotated type of the parameter.
     annotated_type: Option<Type<'db>>,
 
+    /// Does the type of this parameter come from an explicit annotation, or was it inferred from
+    /// the context, like `Self` for the `self` parameter of instance methods.
+    inferred_annotation: bool,
+
     kind: ParameterKind<'db>,
     pub(crate) form: ParameterForm,
 }
@@ -1421,6 +1679,7 @@ impl<'db> Parameter<'db> {
     pub(crate) fn positional_only(name: Option<Name>) -> Self {
         Self {
             annotated_type: None,
+            inferred_annotation: false,
             kind: ParameterKind::PositionalOnly {
                 name,
                 default_type: None,
@@ -1432,6 +1691,7 @@ impl<'db> Parameter<'db> {
     pub(crate) fn positional_or_keyword(name: Name) -> Self {
         Self {
             annotated_type: None,
+            inferred_annotation: false,
             kind: ParameterKind::PositionalOrKeyword {
                 name,
                 default_type: None,
@@ -1443,6 +1703,7 @@ impl<'db> Parameter<'db> {
     pub(crate) fn variadic(name: Name) -> Self {
         Self {
             annotated_type: None,
+            inferred_annotation: false,
             kind: ParameterKind::Variadic { name },
             form: ParameterForm::Value,
         }
@@ -1451,6 +1712,7 @@ impl<'db> Parameter<'db> {
     pub(crate) fn keyword_only(name: Name) -> Self {
         Self {
             annotated_type: None,
+            inferred_annotation: false,
             kind: ParameterKind::KeywordOnly {
                 name,
                 default_type: None,
@@ -1462,6 +1724,7 @@ impl<'db> Parameter<'db> {
     pub(crate) fn keyword_variadic(name: Name) -> Self {
         Self {
             annotated_type: None,
+            inferred_annotation: false,
             kind: ParameterKind::KeywordVariadic { name },
             form: ParameterForm::Value,
         }
@@ -1493,13 +1756,17 @@ impl<'db> Parameter<'db> {
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
         Self {
             annotated_type: self
                 .annotated_type
-                .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, visitor)),
-            kind: self.kind.apply_type_mapping_impl(db, type_mapping, visitor),
+                .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor)),
+            kind: self
+                .kind
+                .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
+            inferred_annotation: self.inferred_annotation,
             form: self.form,
         }
     }
@@ -1515,6 +1782,7 @@ impl<'db> Parameter<'db> {
     ) -> Self {
         let Parameter {
             annotated_type,
+            inferred_annotation,
             kind,
             form,
         } = self;
@@ -1558,6 +1826,7 @@ impl<'db> Parameter<'db> {
 
         Self {
             annotated_type: Some(annotated_type),
+            inferred_annotation: *inferred_annotation,
             kind,
             form: *form,
         }
@@ -1570,16 +1839,12 @@ impl<'db> Parameter<'db> {
         kind: ParameterKind<'db>,
     ) -> Self {
         Self {
-            annotated_type: parameter.annotation().map(|annotation| {
-                definition_expression_type(db, definition, annotation).apply_type_mapping(
-                    db,
-                    &TypeMapping::MarkTypeVarsInferable(Some(BindingContext::Definition(
-                        definition,
-                    ))),
-                )
-            }),
+            annotated_type: parameter
+                .annotation()
+                .map(|annotation| definition_expression_type(db, definition, annotation)),
             kind,
             form: ParameterForm::Value,
+            inferred_annotation: false,
         }
     }
 
@@ -1632,6 +1897,11 @@ impl<'db> Parameter<'db> {
     /// Kind of the parameter.
     pub(crate) fn kind(&self) -> &ParameterKind<'db> {
         &self.kind
+    }
+
+    /// Whether or not the type of this parameter should be displayed.
+    pub(crate) fn should_annotation_be_displayed(&self) -> bool {
+        !self.inferred_annotation
     }
 
     /// Name of the parameter (if it has one).
@@ -1709,25 +1979,30 @@ impl<'db> ParameterKind<'db> {
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
+        let apply_to_default_type = |default_type: &Option<Type<'db>>| {
+            if type_mapping == &TypeMapping::ReplaceParameterDefaults && default_type.is_some() {
+                Some(Type::unknown())
+            } else {
+                default_type
+                    .as_ref()
+                    .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+            }
+        };
+
         match self {
             Self::PositionalOnly { default_type, name } => Self::PositionalOnly {
-                default_type: default_type
-                    .as_ref()
-                    .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, visitor)),
+                default_type: apply_to_default_type(default_type),
                 name: name.clone(),
             },
             Self::PositionalOrKeyword { default_type, name } => Self::PositionalOrKeyword {
-                default_type: default_type
-                    .as_ref()
-                    .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, visitor)),
+                default_type: apply_to_default_type(default_type),
                 name: name.clone(),
             },
             Self::KeywordOnly { default_type, name } => Self::KeywordOnly {
-                default_type: default_type
-                    .as_ref()
-                    .map(|ty| ty.apply_type_mapping_impl(db, type_mapping, visitor)),
+                default_type: apply_to_default_type(default_type),
                 name: name.clone(),
             },
             Self::Variadic { .. } | Self::KeywordVariadic { .. } => self.clone(),
@@ -1772,7 +2047,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         assert!(sig.return_ty.is_none());
         assert_params(&sig, &[]);
@@ -1797,7 +2072,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         assert_eq!(sig.return_ty.unwrap().display(&db).to_string(), "bytes");
         assert_params(
@@ -1849,7 +2124,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         let [
             Parameter {
@@ -1887,7 +2162,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         let [
             Parameter {
@@ -1925,7 +2200,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         let [
             Parameter {
@@ -1969,7 +2244,7 @@ mod tests {
             .literal(&db)
             .last_definition(&db);
 
-        let sig = func.signature(&db, None);
+        let sig = func.signature(&db);
 
         let [
             Parameter {
@@ -2006,7 +2281,7 @@ mod tests {
         let func = get_function_f(&db, "/src/a.py");
 
         let overload = func.literal(&db).last_definition(&db);
-        let expected_sig = overload.signature(&db, None);
+        let expected_sig = overload.signature(&db);
 
         // With no decorators, internal and external signature are the same
         assert_eq!(

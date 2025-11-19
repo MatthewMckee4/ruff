@@ -7,7 +7,8 @@ use ruff_annotate_snippets::Level as AnnotateLevel;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 pub use self::render::{
-    DisplayDiagnostic, DisplayDiagnostics, FileResolver, Input, ceil_char_boundary,
+    DisplayDiagnostic, DisplayDiagnostics, DummyFileResolver, FileResolver, Input,
+    ceil_char_boundary,
     github::{DisplayGithubDiagnostics, GithubRenderer},
 };
 use crate::{Db, files::File};
@@ -63,12 +64,15 @@ impl Diagnostic {
             id,
             severity,
             message: message.into_diagnostic_message(),
+            custom_concise_message: None,
+            documentation_url: None,
             annotations: vec![],
             subs: vec![],
             fix: None,
             parent: None,
             noqa_offset: None,
             secondary_code: None,
+            header_offset: 0,
         });
         Diagnostic { inner }
     }
@@ -82,17 +86,14 @@ impl Diagnostic {
     /// at time of writing, `ruff_db` depends on `ruff_python_parser` instead of
     /// the other way around. And since we want to do this conversion in a couple
     /// places, it makes sense to centralize it _somewhere_. So it's here for now.
-    ///
-    /// Note that `message` is stored in the primary annotation, _not_ in the primary diagnostic
-    /// message.
     pub fn invalid_syntax(
         span: impl Into<Span>,
         message: impl IntoDiagnosticMessage,
         range: impl Ranged,
     ) -> Diagnostic {
-        let mut diag = Diagnostic::new(DiagnosticId::InvalidSyntax, Severity::Error, "");
+        let mut diag = Diagnostic::new(DiagnosticId::InvalidSyntax, Severity::Error, message);
         let span = span.into().with_range(range.range());
-        diag.annotate(Annotation::primary(span).message(message));
+        diag.annotate(Annotation::primary(span));
         diag
     }
 
@@ -214,6 +215,10 @@ impl Diagnostic {
     /// cases, just converting it to a string (or printing it) will do what
     /// you want.
     pub fn concise_message(&self) -> ConciseMessage<'_> {
+        if let Some(custom_message) = &self.inner.custom_concise_message {
+            return ConciseMessage::Custom(custom_message.as_str());
+        }
+
         let main = self.inner.message.as_str();
         let annotation = self
             .primary_annotation()
@@ -225,6 +230,15 @@ impl Diagnostic {
             (false, false) => ConciseMessage::Both { main, annotation },
             (true, true) => ConciseMessage::Empty,
         }
+    }
+
+    /// Set a custom message for the concise formatting of this diagnostic.
+    ///
+    /// This overrides the default behavior of generating a concise message
+    /// from the main diagnostic message and the primary annotation.
+    pub fn set_concise_message(&mut self, message: impl IntoDiagnosticMessage) {
+        Arc::make_mut(&mut self.inner).custom_concise_message =
+            Some(message.into_diagnostic_message());
     }
 
     /// Returns the severity of this diagnostic.
@@ -357,6 +371,14 @@ impl Diagnostic {
             .is_some_and(|fix| fix.applies(config.fix_applicability))
     }
 
+    pub fn documentation_url(&self) -> Option<&str> {
+        self.inner.documentation_url.as_deref()
+    }
+
+    pub fn set_documentation_url(&mut self, url: Option<String>) {
+        Arc::make_mut(&mut self.inner).documentation_url = url;
+    }
+
     /// Returns the offset of the parent statement for this diagnostic if it exists.
     ///
     /// This is primarily used for checking noqa/secondary code suppressions.
@@ -430,19 +452,6 @@ impl Diagnostic {
             .map(|sub| sub.inner.message.as_str())
     }
 
-    /// Returns the URL for the rule documentation, if it exists.
-    pub fn to_ruff_url(&self) -> Option<String> {
-        if self.is_invalid_syntax() {
-            None
-        } else {
-            Some(format!(
-                "{}/rules/{}",
-                env!("CARGO_PKG_HOMEPAGE"),
-                self.name()
-            ))
-        }
-    }
-
     /// Returns the filename for the message.
     ///
     /// Panics if the diagnostic has no primary span, or if its file is not a `SourceFile`.
@@ -512,19 +521,27 @@ impl Diagnostic {
 
         a.cmp(&b)
     }
+
+    /// Add an offset for aligning the header sigil with the line number separators in a diff.
+    pub fn set_header_offset(&mut self, offset: usize) {
+        Arc::make_mut(&mut self.inner).header_offset = offset;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, get_size2::GetSize)]
 struct DiagnosticInner {
     id: DiagnosticId,
+    documentation_url: Option<String>,
     severity: Severity,
     message: DiagnosticMessage,
+    custom_concise_message: Option<DiagnosticMessage>,
     annotations: Vec<Annotation>,
     subs: Vec<SubDiagnostic>,
     fix: Option<Fix>,
     parent: Option<TextSize>,
     noqa_offset: Option<TextSize>,
     secondary_code: Option<SecondaryCode>,
+    header_offset: usize,
 }
 
 struct RenderingSortKey<'a> {
@@ -742,11 +759,11 @@ pub struct Annotation {
     is_primary: bool,
     /// The diagnostic tags associated with this annotation.
     tags: Vec<DiagnosticTag>,
-    /// Whether this annotation is a file-level or full-file annotation.
+    /// Whether the snippet for this annotation should be hidden.
     ///
     /// When set, rendering will only include the file's name and (optional) range. Everything else
     /// is omitted, including any file snippet or message.
-    is_file_level: bool,
+    hide_snippet: bool,
 }
 
 impl Annotation {
@@ -765,7 +782,7 @@ impl Annotation {
             message: None,
             is_primary: true,
             tags: Vec::new(),
-            is_file_level: false,
+            hide_snippet: false,
         }
     }
 
@@ -782,7 +799,7 @@ impl Annotation {
             message: None,
             is_primary: false,
             tags: Vec::new(),
-            is_file_level: false,
+            hide_snippet: false,
         }
     }
 
@@ -849,19 +866,20 @@ impl Annotation {
         self.tags.push(tag);
     }
 
-    /// Set whether or not this annotation is file-level.
+    /// Set whether or not the snippet on this annotation should be suppressed when rendering.
     ///
-    /// File-level annotations are only rendered with their file name and range, if available. This
-    /// is intended for backwards compatibility with Ruff diagnostics, which historically used
+    /// Such annotations are only rendered with their file name and range, if available. This is
+    /// intended for backwards compatibility with Ruff diagnostics, which historically used
     /// `TextRange::default` to indicate a file-level diagnostic. In the new diagnostic model, a
     /// [`Span`] with a range of `None` should be used instead, as mentioned in the `Span`
     /// documentation.
     ///
     /// TODO(brent) update this usage in Ruff and remove `is_file_level` entirely. See
     /// <https://github.com/astral-sh/ruff/issues/19688>, especially my first comment, for more
-    /// details.
-    pub fn set_file_level(&mut self, yes: bool) {
-        self.is_file_level = yes;
+    /// details. As of 2025-09-26 we also use this to suppress snippet rendering for formatter
+    /// diagnostics, which also need to have a range, so we probably can't eliminate this entirely.
+    pub fn hide_snippet(&mut self, yes: bool) {
+        self.hide_snippet = yes;
     }
 }
 
@@ -1016,6 +1034,17 @@ pub enum DiagnosticId {
 
     /// Use of a deprecated setting.
     DeprecatedSetting,
+
+    /// The code needs to be formatted.
+    Unformatted,
+
+    /// Use of an invalid command-line option.
+    InvalidCliOption,
+
+    /// An internal assumption was violated.
+    ///
+    /// This indicates a bug in the program rather than a user error.
+    InternalError,
 }
 
 impl DiagnosticId {
@@ -1055,6 +1084,9 @@ impl DiagnosticId {
             DiagnosticId::UnnecessaryOverridesSection => "unnecessary-overrides-section",
             DiagnosticId::UselessOverridesSection => "useless-overrides-section",
             DiagnosticId::DeprecatedSetting => "deprecated-setting",
+            DiagnosticId::Unformatted => "unformatted",
+            DiagnosticId::InvalidCliOption => "invalid-cli-option",
+            DiagnosticId::InternalError => "internal-error",
         }
     }
 
@@ -1491,6 +1523,8 @@ pub enum ConciseMessage<'a> {
     /// This indicates that the diagnostic is probably using the old
     /// model.
     Empty,
+    /// A custom concise message has been provided.
+    Custom(&'a str),
 }
 
 impl std::fmt::Display for ConciseMessage<'_> {
@@ -1506,6 +1540,9 @@ impl std::fmt::Display for ConciseMessage<'_> {
                 write!(f, "{main}: {annotation}")
             }
             ConciseMessage::Empty => Ok(()),
+            ConciseMessage::Custom(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }

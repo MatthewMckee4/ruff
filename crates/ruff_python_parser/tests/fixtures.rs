@@ -527,6 +527,10 @@ impl SemanticSyntaxContext for SemanticSyntaxCheckerVisitor<'_> {
         None
     }
 
+    fn has_nonlocal_binding(&self, _name: &str) -> bool {
+        true
+    }
+
     fn in_async_context(&self) -> bool {
         if let Some(scope) = self.scopes.iter().next_back() {
             match scope {
@@ -570,6 +574,14 @@ impl SemanticSyntaxContext for SemanticSyntaxCheckerVisitor<'_> {
 
     fn in_generator_scope(&self) -> bool {
         true
+    }
+
+    fn in_loop_context(&self) -> bool {
+        true
+    }
+
+    fn is_bound_parameter(&self, _name: &str) -> bool {
+        false
     }
 }
 

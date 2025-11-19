@@ -3,10 +3,9 @@ use std::time::Instant;
 
 use lsp_types::request::Completion;
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionParams,
-    CompletionResponse, Documentation, TextEdit, Url,
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionList,
+    CompletionParams, CompletionResponse, Documentation, TextEdit, Url,
 };
-use ruff_db::source::{line_index, source_text};
 use ruff_source_file::OneIndexed;
 use ruff_text_size::Ranged;
 use ty_ide::{CompletionKind, CompletionSettings, completion};
@@ -45,17 +44,18 @@ impl BackgroundDocumentRequestHandler for CompletionRequestHandler {
             return Ok(None);
         }
 
-        let Some(file) = snapshot.file(db) else {
+        let Some(file) = snapshot.to_notebook_or_file(db) else {
             return Ok(None);
         };
 
-        let source = source_text(db, file);
-        let line_index = line_index(db, file);
-        let offset = params.text_document_position.position.to_text_size(
-            &source,
-            &line_index,
+        let Some(offset) = params.text_document_position.position.to_text_size(
+            db,
+            file,
+            snapshot.url(),
             snapshot.encoding(),
-        );
+        ) else {
+            return Ok(None);
+        };
         let settings = CompletionSettings {
             auto_import: snapshot.global_settings().is_auto_import_enabled(),
         };
@@ -72,24 +72,40 @@ impl BackgroundDocumentRequestHandler for CompletionRequestHandler {
             .map(|(i, comp)| {
                 let kind = comp.kind(db).map(ty_kind_to_lsp_kind);
                 let type_display = comp.ty.map(|ty| ty.display(db).to_string());
-                let import_edit = comp.import.as_ref().map(|edit| {
-                    let range =
-                        edit.range()
-                            .to_lsp_range(&source, &line_index, snapshot.encoding());
-                    TextEdit {
+                let import_edit = comp.import.as_ref().and_then(|edit| {
+                    let range = edit
+                        .range()
+                        .to_lsp_range(db, file, snapshot.encoding())?
+                        .local_range();
+                    Some(TextEdit {
                         range,
                         new_text: edit.content().map(ToString::to_string).unwrap_or_default(),
-                    }
+                    })
                 });
+
+                let name = comp.name.to_string();
+                let import_suffix = comp.module_name.map(|name| format!(" (import {name})"));
+                let (label, label_details) = if snapshot
+                    .resolved_client_capabilities()
+                    .supports_completion_item_label_details()
+                {
+                    let label_details = CompletionItemLabelDetails {
+                        detail: import_suffix,
+                        description: type_display.clone(),
+                    };
+                    (name, Some(label_details))
+                } else {
+                    let label = import_suffix
+                        .map(|suffix| format!("{name}{suffix}"))
+                        .unwrap_or_else(|| name);
+                    (label, None)
+                };
                 CompletionItem {
-                    label: comp.name.into(),
+                    label,
                     kind,
                     sort_text: Some(format!("{i:-max_index_len$}")),
-                    detail: type_display.clone(),
-                    label_details: Some(CompletionItemLabelDetails {
-                        detail: comp.module_name.map(|name| format!(" (import {name})")),
-                        description: type_display,
-                    }),
+                    detail: type_display,
+                    label_details,
                     insert_text: comp.insert.map(String::from),
                     additional_text_edits: import_edit.map(|edit| vec![edit]),
                     documentation: comp
@@ -100,7 +116,10 @@ impl BackgroundDocumentRequestHandler for CompletionRequestHandler {
             })
             .collect();
         let len = items.len();
-        let response = CompletionResponse::Array(items);
+        let response = CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items,
+        });
         tracing::debug!(
             "Completions request returned {len} suggestions in {elapsed:?}",
             elapsed = Instant::now().duration_since(start)

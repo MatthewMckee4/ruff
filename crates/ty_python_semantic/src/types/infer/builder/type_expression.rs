@@ -4,10 +4,9 @@ use ruff_python_ast as ast;
 use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::diagnostic::{
     self, INVALID_TYPE_FORM, NON_SUBSCRIPTABLE, report_invalid_argument_number_to_special_form,
-    report_invalid_arguments_to_annotated, report_invalid_arguments_to_callable,
+    report_invalid_arguments_to_callable,
 };
-use crate::types::enums::is_enum_class;
-use crate::types::signatures::{CallableSignature, Signature};
+use crate::types::signatures::Signature;
 use crate::types::string_annotation::parse_string_annotation;
 use crate::types::tuple::{TupleSpecBuilder, TupleType};
 use crate::types::visitor::any_over_type;
@@ -21,8 +20,23 @@ use crate::types::{
 impl<'db> TypeInferenceBuilder<'db, '_> {
     /// Infer the type of a type expression.
     pub(super) fn infer_type_expression(&mut self, expression: &ast::Expr) -> Type<'db> {
+        let previous_deferred_state = self.deferred_state;
+
+        // `DeferredExpressionState::InStringAnnotation` takes precedence over other states.
+        // However, if it's not a stringified annotation, we must still ensure that annotation expressions
+        // are always deferred in stub files.
+        match previous_deferred_state {
+            DeferredExpressionState::None => {
+                if self.in_stub() {
+                    self.deferred_state = DeferredExpressionState::Deferred;
+                }
+            }
+            DeferredExpressionState::InStringAnnotation(_) | DeferredExpressionState::Deferred => {}
+        }
         let mut ty = self.infer_type_expression_no_store(expression);
-        let divergent = Type::divergent(self.scope());
+        self.deferred_state = previous_deferred_state;
+
+        let divergent = Type::divergent(Some(self.scope()));
         if ty.has_divergent_type(self.db(), divergent) {
             ty = divergent;
         }
@@ -319,7 +333,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::If(if_expression) => {
-                self.infer_if_expression(if_expression);
+                self.infer_if_expression(if_expression, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("`if` expressions are not allowed in type expressions"),
@@ -346,7 +360,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::DictComp(dictcomp) => {
-                self.infer_dict_comprehension_expression(dictcomp);
+                self.infer_dict_comprehension_expression(dictcomp, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("Dict comprehensions are not allowed in type expressions"),
@@ -355,7 +369,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::ListComp(listcomp) => {
-                self.infer_list_comprehension_expression(listcomp);
+                self.infer_list_comprehension_expression(listcomp, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("List comprehensions are not allowed in type expressions"),
@@ -364,7 +378,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::SetComp(setcomp) => {
-                self.infer_set_comprehension_expression(setcomp);
+                self.infer_set_comprehension_expression(setcomp, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("Set comprehensions are not allowed in type expressions"),
@@ -588,7 +602,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             // TODO: emit a diagnostic
                         }
                     } else {
-                        element_types.push(element_ty);
+                        element_types.push(element_ty.fallback_to_divergent(self.db()));
                     }
                 }
 
@@ -811,8 +825,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.infer_type_expression(slice);
                     todo_type!("Generic manual PEP-695 type alias")
                 }
+                KnownInstanceType::UnionType(_) => {
+                    self.infer_type_expression(slice);
+                    todo_type!("Generic specialization of types.UnionType")
+                }
+                KnownInstanceType::Literal(ty) | KnownInstanceType::TypeGenericAlias(ty) => {
+                    self.infer_type_expression(slice);
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                        builder.into_diagnostic(format_args!(
+                            "`{ty}` is not a generic class",
+                            ty = ty.inner(self.db()).display(self.db())
+                        ));
+                    }
+                    Type::unknown()
+                }
+                KnownInstanceType::Callable(_) => {
+                    self.infer_type_expression(slice);
+                    todo_type!("Generic specialization of typing.Callable")
+                }
+                KnownInstanceType::Annotated(_) => {
+                    self.infer_type_expression(slice);
+                    todo_type!("Generic specialization of typing.Annotated")
+                }
+                KnownInstanceType::NewType(newtype) => {
+                    self.infer_type_expression(&subscript.slice);
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                        builder.into_diagnostic(format_args!(
+                            "`{}` is a `NewType` and cannot be specialized",
+                            newtype.name(self.db())
+                        ));
+                    }
+                    Type::unknown()
+                }
             },
-            Type::Dynamic(DynamicType::Todo(_)) => {
+            Type::Dynamic(_) => {
                 self.infer_type_expression(slice);
                 value_ty
             }
@@ -841,11 +887,27 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                 }
             }
-            _ => {
-                // TODO: Emit a diagnostic once we've implemented all valid subscript type
-                // expressions.
+            Type::GenericAlias(_) => {
                 self.infer_type_expression(slice);
-                todo_type!("unknown type subscript")
+                // If the generic alias is already fully specialized, this is an error. But it
+                // could have been specialized with another typevar (e.g. a type alias like `MyList
+                // = list[T]`), in which case it's later valid to do `MyList[int]`.
+                todo_type!("specialized generic alias in type expression")
+            }
+            Type::StringLiteral(_) => {
+                self.infer_type_expression(slice);
+                // For stringified TypeAlias; remove once properly supported
+                todo_type!("string literal subscripted in type expression")
+            }
+            _ => {
+                self.infer_type_expression(slice);
+                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                    builder.into_diagnostic(format_args!(
+                        "Invalid subscript of object of type `{}` in type expression",
+                        value_ty.display(self.db())
+                    ));
+                }
+                Type::unknown()
             }
         }
     }
@@ -887,7 +949,59 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         ty
     }
 
-    fn infer_parameterized_special_form_type_expression(
+    /// Infer the type of a `Callable[...]` type expression.
+    pub(crate) fn infer_callable_type(&mut self, subscript: &ast::ExprSubscript) -> Type<'db> {
+        let db = self.db();
+
+        let arguments_slice = &*subscript.slice;
+
+        let mut arguments = match arguments_slice {
+            ast::Expr::Tuple(tuple) => Either::Left(tuple.iter()),
+            _ => {
+                self.infer_callable_parameter_types(arguments_slice);
+                Either::Right(std::iter::empty::<&ast::Expr>())
+            }
+        };
+
+        let first_argument = arguments.next();
+
+        let parameters = first_argument.and_then(|arg| self.infer_callable_parameter_types(arg));
+
+        let return_type = arguments.next().map(|arg| self.infer_type_expression(arg));
+
+        let correct_argument_number = if let Some(third_argument) = arguments.next() {
+            self.infer_type_expression(third_argument);
+            for argument in arguments {
+                self.infer_type_expression(argument);
+            }
+            false
+        } else {
+            return_type.is_some()
+        };
+
+        if !correct_argument_number {
+            report_invalid_arguments_to_callable(&self.context, subscript);
+        }
+
+        let callable_type = if let (Some(parameters), Some(return_type), true) =
+            (parameters, return_type, correct_argument_number)
+        {
+            CallableType::single(db, Signature::new(parameters, Some(return_type)))
+        } else {
+            CallableType::unknown(db)
+        };
+
+        // `Signature` / `Parameters` are not a `Type` variant, so we're storing
+        // the outer callable type on these expressions instead.
+        self.store_expression_type(arguments_slice, callable_type);
+        if let Some(first_argument) = first_argument {
+            self.store_expression_type(first_argument, callable_type);
+        }
+
+        callable_type
+    }
+
+    pub(crate) fn infer_parameterized_special_form_type_expression(
         &mut self,
         subscript: &ast::ExprSubscript,
         special_form: SpecialFormType,
@@ -896,36 +1010,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let arguments_slice = &*subscript.slice;
         match special_form {
             SpecialFormType::Annotated => {
-                let ast::Expr::Tuple(ast::ExprTuple {
-                    elts: arguments, ..
-                }) = arguments_slice
-                else {
-                    report_invalid_arguments_to_annotated(&self.context, subscript);
-
-                    // `Annotated[]` with less than two arguments is an error at runtime.
-                    // However, we still treat `Annotated[T]` as `T` here for the purpose of
-                    // giving better diagnostics later on.
-                    // Pyright also does this. Mypy doesn't; it falls back to `Any` instead.
-                    return self.infer_type_expression(arguments_slice);
-                };
-
-                if arguments.len() < 2 {
-                    report_invalid_arguments_to_annotated(&self.context, subscript);
-                }
-
-                let [type_expr, metadata @ ..] = &arguments[..] else {
-                    for argument in arguments {
-                        self.infer_expression(argument, TypeContext::default());
-                    }
-                    self.store_expression_type(arguments_slice, Type::unknown());
-                    return Type::unknown();
-                };
-
-                for element in metadata {
-                    self.infer_expression(element, TypeContext::default());
-                }
-
-                let ty = self.infer_type_expression(type_expr);
+                let ty = self
+                    .infer_subscript_load_impl(
+                        Type::SpecialForm(SpecialFormType::Annotated),
+                        subscript,
+                    )
+                    .in_type_expression(db, self.scope(), None)
+                    .unwrap_or_else(|err| err.into_fallback_type(&self.context, subscript, true));
                 self.store_expression_type(arguments_slice, ty);
                 ty
             }
@@ -960,53 +1051,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 }
                 _ => self.infer_type_expression(arguments_slice),
             },
-            SpecialFormType::Callable => {
-                let mut arguments = match arguments_slice {
-                    ast::Expr::Tuple(tuple) => Either::Left(tuple.iter()),
-                    _ => {
-                        self.infer_callable_parameter_types(arguments_slice);
-                        Either::Right(std::iter::empty::<&ast::Expr>())
-                    }
-                };
-
-                let first_argument = arguments.next();
-
-                let parameters =
-                    first_argument.and_then(|arg| self.infer_callable_parameter_types(arg));
-
-                let return_type = arguments.next().map(|arg| self.infer_type_expression(arg));
-
-                let correct_argument_number = if let Some(third_argument) = arguments.next() {
-                    self.infer_type_expression(third_argument);
-                    for argument in arguments {
-                        self.infer_type_expression(argument);
-                    }
-                    false
-                } else {
-                    return_type.is_some()
-                };
-
-                if !correct_argument_number {
-                    report_invalid_arguments_to_callable(&self.context, subscript);
-                }
-
-                let callable_type = if let (Some(parameters), Some(return_type), true) =
-                    (parameters, return_type, correct_argument_number)
-                {
-                    CallableType::single(db, Signature::new(parameters, Some(return_type)))
-                } else {
-                    CallableType::unknown(db)
-                };
-
-                // `Signature` / `Parameters` are not a `Type` variant, so we're storing
-                // the outer callable type on these expressions instead.
-                self.store_expression_type(arguments_slice, callable_type);
-                if let Some(first_argument) = first_argument {
-                    self.store_expression_type(first_argument, callable_type);
-                }
-
-                callable_type
-            }
+            SpecialFormType::Callable => self.infer_callable_type(subscript),
 
             // `ty_extensions` special forms
             SpecialFormType::Not => {
@@ -1156,26 +1201,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 }
 
                 let argument_type = self.infer_expression(&arguments[0], TypeContext::default());
-                let bindings = argument_type.bindings(db);
 
-                // SAFETY: This is enforced by the constructor methods on `Bindings` even in
-                // the case of a non-callable union.
-                let callable_binding = bindings
-                    .into_iter()
-                    .next()
-                    .expect("`Bindings` should have at least one `CallableBinding`");
-
-                let mut signature_iter = callable_binding.into_iter().map(|binding| {
-                    if let Some(bound_method) = argument_type.into_bound_method() {
-                        binding
-                            .signature
-                            .bind_self(self.db(), Some(bound_method.typing_self_type(db)))
-                    } else {
-                        binding.signature.clone()
-                    }
-                });
-
-                let Some(signature) = signature_iter.next() else {
+                let Some(callable_type) = argument_type.try_upcast_to_callable(db) else {
                     if let Some(builder) = self
                         .context
                         .report_lint(&INVALID_TYPE_FORM, arguments_slice)
@@ -1193,14 +1220,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     return Type::unknown();
                 };
 
-                let signature = CallableSignature::from_overloads(
-                    std::iter::once(signature).chain(signature_iter),
-                );
-                let callable_type_of = Type::Callable(CallableType::new(db, signature, false));
                 if arguments_slice.is_tuple_expr() {
-                    self.store_expression_type(arguments_slice, callable_type_of);
+                    self.store_expression_type(arguments_slice, callable_type);
                 }
-                callable_type_of
+                callable_type
             }
 
             SpecialFormType::ChainMap => self.infer_parameterized_legacy_typing_alias(
@@ -1386,12 +1409,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
     }
 
-    fn infer_literal_parameter_type<'param>(
+    pub(crate) fn infer_literal_parameter_type<'param>(
         &mut self,
         parameters: &'param ast::Expr,
     ) -> Result<Type<'db>, Vec<&'param ast::Expr>> {
         Ok(match parameters {
-            // TODO handle type aliases
             ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. }) => {
                 let value_ty = self.infer_expression(value, TypeContext::default());
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Literal)) {
@@ -1443,27 +1465,6 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             literal @ ast::Expr::NumberLiteral(number) if number.value.is_int() => {
                 self.infer_expression(literal, TypeContext::default())
             }
-            // For enum values
-            ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) => {
-                let value_ty = self.infer_expression(value, TypeContext::default());
-
-                if is_enum_class(self.db(), value_ty) {
-                    let ty = value_ty
-                        .member(self.db(), &attr.id)
-                        .place
-                        .ignore_possibly_unbound()
-                        .unwrap_or(Type::unknown());
-                    self.store_expression_type(parameters, ty);
-                    ty
-                } else {
-                    self.store_expression_type(parameters, Type::unknown());
-                    if value_ty.is_todo() {
-                        value_ty
-                    } else {
-                        return Err(vec![parameters]);
-                    }
-                }
-            }
             // for negative and positive numbers
             ast::Expr::UnaryOp(u)
                 if matches!(u.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd)
@@ -1472,6 +1473,37 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let ty = self.infer_unary_expression(u);
                 self.store_expression_type(parameters, ty);
                 ty
+            }
+            // enum members and aliases to literal types
+            ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
+                let subscript_ty = self.infer_expression(parameters, TypeContext::default());
+                match subscript_ty {
+                    // type aliases to literal types
+                    Type::KnownInstance(KnownInstanceType::TypeAliasType(type_alias)) => {
+                        let value_ty = type_alias.value_type(self.db());
+                        if value_ty.is_literal_or_union_of_literals(self.db()) {
+                            return Ok(value_ty);
+                        }
+                    }
+                    Type::KnownInstance(KnownInstanceType::Literal(ty)) => {
+                        return Ok(ty.inner(self.db()));
+                    }
+                    // `Literal[SomeEnum.Member]`
+                    Type::EnumLiteral(_) => {
+                        return Ok(subscript_ty);
+                    }
+                    // `Literal[SingletonEnum.Member]`, where `SingletonEnum.Member` simplifies to
+                    // just `SingletonEnum`.
+                    Type::NominalInstance(_) if subscript_ty.is_enum(self.db()) => {
+                        return Ok(subscript_ty);
+                    }
+                    // suppress false positives for e.g. members of functional-syntax enums
+                    Type::Dynamic(DynamicType::Todo(_)) => {
+                        return Ok(subscript_ty);
+                    }
+                    _ => {}
+                }
+                return Err(vec![parameters]);
             }
             _ => {
                 self.infer_expression(parameters, TypeContext::default());
@@ -1485,7 +1517,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     ///
     /// It returns `None` if the argument is invalid i.e., not a list of types, parameter
     /// specification, `typing.Concatenate`, or `...`.
-    fn infer_callable_parameter_types(
+    pub(super) fn infer_callable_parameter_types(
         &mut self,
         parameters: &ast::Expr,
     ) -> Option<Parameters<'db>> {
@@ -1536,7 +1568,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     self.db(),
                     self.infer_name_load(name),
                     &|ty| match ty {
-                        Type::Dynamic(DynamicType::TodoPEP695ParamSpec) => true,
+                        Type::KnownInstance(known_instance) => {
+                            known_instance.class(self.db()) == KnownClass::ParamSpec
+                        }
                         Type::NominalInstance(nominal) => {
                             nominal.has_known_class(self.db(), KnownClass::ParamSpec)
                         }

@@ -12,7 +12,7 @@ use crate::parenthesize::parenthesized_range;
 use crate::statement_visitor::StatementVisitor;
 use crate::visitor::Visitor;
 use crate::{
-    self as ast, Arguments, AtomicNodeIndex, CmpOp, DictItem, ExceptHandler, Expr,
+    self as ast, Arguments, AtomicNodeIndex, CmpOp, DictItem, ExceptHandler, Expr, ExprNoneLiteral,
     InterpolatedStringElement, MatchCase, Operator, Pattern, Stmt, TypeParam,
 };
 use crate::{AnyNodeRef, ExprContext};
@@ -1219,6 +1219,8 @@ impl Truthiness {
         F: Fn(&str) -> bool,
     {
         match expr {
+            Expr::Lambda(_) => Self::Truthy,
+            Expr::Generator(_) => Self::Truthy,
             Expr::StringLiteral(ast::ExprStringLiteral { value, .. }) => {
                 if value.is_empty() {
                     Self::Falsey
@@ -1316,9 +1318,19 @@ impl Truthiness {
                         if arguments.is_empty() {
                             // Ex) `list()`
                             Self::Falsey
-                        } else if arguments.args.len() == 1 && arguments.keywords.is_empty() {
+                        } else if let [argument] = &*arguments.args
+                            && arguments.keywords.is_empty()
+                        {
                             // Ex) `list([1, 2, 3])`
-                            Self::from_expr(&arguments.args[0], is_builtin)
+                            // For tuple(generator), we can't determine statically if the result will
+                            // be empty or not, so return Unknown. The generator itself is truthy, but
+                            // tuple(empty_generator) is falsy. ListComp and SetComp are handled by
+                            // recursing into Self::from_expr below, which returns Unknown for them.
+                            if argument.is_generator_expr() {
+                                Self::Unknown
+                            } else {
+                                Self::from_expr(argument, is_builtin)
+                            }
                         } else {
                             Self::Unknown
                         }
@@ -1388,7 +1400,9 @@ fn is_non_empty_f_string(expr: &ast::ExprFString) -> bool {
             Expr::FString(f_string) => is_non_empty_f_string(f_string),
             // These literals may or may not be empty.
             Expr::StringLiteral(ast::ExprStringLiteral { value, .. }) => !value.is_empty(),
-            Expr::BytesLiteral(ast::ExprBytesLiteral { value, .. }) => !value.is_empty(),
+            // Confusingly, f"{b""}" renders as the string 'b""', which is non-empty.
+            // Therefore, any bytes interpolation is guaranteed non-empty when stringified.
+            Expr::BytesLiteral(_) => true,
         }
     }
 
@@ -1397,7 +1411,9 @@ fn is_non_empty_f_string(expr: &ast::ExprFString) -> bool {
         ast::FStringPart::FString(f_string) => {
             f_string.elements.iter().all(|element| match element {
                 InterpolatedStringElement::Literal(string_literal) => !string_literal.is_empty(),
-                InterpolatedStringElement::Interpolation(f_string) => inner(&f_string.expression),
+                InterpolatedStringElement::Interpolation(f_string) => {
+                    f_string.debug_text.is_some() || inner(&f_string.expression)
+                }
             })
         }
     })
@@ -1493,7 +1509,7 @@ pub fn pep_604_optional(expr: &Expr) -> Expr {
     ast::ExprBinOp {
         left: Box::new(expr.clone()),
         op: Operator::BitOr,
-        right: Box::new(Expr::NoneLiteral(ast::ExprNoneLiteral::default())),
+        right: Box::new(Expr::NoneLiteral(ExprNoneLiteral::default())),
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
     }

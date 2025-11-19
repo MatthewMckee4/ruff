@@ -5,10 +5,14 @@ use super::{
     CallArguments, CallDunderError, ClassBase, ClassLiteral, KnownClass,
     add_inferred_python_version_hint_to_diagnostic,
 };
+use crate::diagnostic::did_you_mean;
+use crate::diagnostic::format_enumeration;
 use crate::lint::{Level, LintRegistryBuilder, LintStatus};
 use crate::semantic_index::definition::{Definition, DefinitionKind};
 use crate::semantic_index::place::{PlaceTable, ScopedPlaceId};
+use crate::semantic_index::{global_scope, place_table};
 use crate::suppression::FileSuppressionId;
+use crate::types::KnownInstanceType;
 use crate::types::call::CallError;
 use crate::types::class::{DisjointBase, DisjointBaseKind, Field};
 use crate::types::function::KnownFunction;
@@ -18,18 +22,18 @@ use crate::types::string_annotation::{
     RAW_STRING_TYPE_ANNOTATION,
 };
 use crate::types::{
-    ClassType, DynamicType, LintDiagnosticGuard, Protocol, ProtocolInstanceType, SubclassOfInner,
-    binding_type, infer_isolated_expression,
+    BoundTypeVarInstance, ClassType, DynamicType, LintDiagnosticGuard, Protocol,
+    ProtocolInstanceType, SpecialFormType, SubclassOfInner, Type, TypeContext, binding_type,
+    infer_isolated_expression, protocol_class::ProtocolClass,
 };
-use crate::types::{SpecialFormType, Type, protocol_class::ProtocolClass};
-use crate::util::diagnostics::format_enumeration;
-use crate::{
-    Db, DisplaySettings, FxIndexMap, FxOrderMap, Module, ModuleName, Program, declare_lint,
-};
+use crate::{Db, DisplaySettings, FxIndexMap, Module, ModuleName, Program, declare_lint};
 use itertools::Itertools;
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
+use ruff_db::source::source_text;
 use ruff_python_ast::name::Name;
-use ruff_python_ast::{self as ast, AnyNodeRef};
+use ruff_python_ast::parenthesize::parentheses_iterator;
+use ruff_python_ast::{self as ast, AnyNodeRef, Identifier};
+use ruff_python_trivia::CommentRanges;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use std::fmt::Formatter;
@@ -61,9 +65,12 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&INVALID_EXCEPTION_CAUGHT);
     registry.register_lint(&INVALID_GENERIC_CLASS);
     registry.register_lint(&INVALID_LEGACY_TYPE_VARIABLE);
+    registry.register_lint(&INVALID_PARAMSPEC);
     registry.register_lint(&INVALID_TYPE_ALIAS_TYPE);
+    registry.register_lint(&INVALID_NEWTYPE);
     registry.register_lint(&INVALID_METACLASS);
     registry.register_lint(&INVALID_OVERLOAD);
+    registry.register_lint(&USELESS_OVERLOAD_BODY);
     registry.register_lint(&INVALID_PARAMETER_DEFAULT);
     registry.register_lint(&INVALID_PROTOCOL);
     registry.register_lint(&INVALID_NAMED_TUPLE);
@@ -124,7 +131,7 @@ declare_lint! {
     /// ```
     pub(crate) static CALL_NON_CALLABLE = {
         summary: "detects calls to non-callable objects",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -150,7 +157,7 @@ declare_lint! {
     /// ```
     pub(crate) static POSSIBLY_MISSING_IMPLICIT_CALL = {
         summary: "detects implicit calls to possibly missing methods",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.22"),
         default_level: Level::Warn,
     }
 }
@@ -176,7 +183,7 @@ declare_lint! {
     /// ```
     pub(crate) static CONFLICTING_ARGUMENT_FORMS = {
         summary: "detects when an argument is used as both a value and a type form in a call",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -201,7 +208,7 @@ declare_lint! {
     /// ```
     pub(crate) static CONFLICTING_DECLARATIONS = {
         summary: "detects conflicting declarations",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -227,7 +234,7 @@ declare_lint! {
     /// ```
     pub(crate) static CONFLICTING_METACLASS = {
         summary: "detects conflicting metaclasses",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -253,7 +260,7 @@ declare_lint! {
     /// [method resolution order]: https://docs.python.org/3/glossary.html#term-method-resolution-order
     pub(crate) static CYCLIC_CLASS_DEFINITION = {
         summary: "detects cyclic class definitions",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -271,7 +278,7 @@ declare_lint! {
     /// ```
     pub(crate) static DIVISION_BY_ZERO = {
         summary: "detects division by zero",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::preview("0.0.1-alpha.1"),
         default_level: Level::Ignore,
     }
 }
@@ -292,7 +299,7 @@ declare_lint! {
     /// ```
     pub(crate) static DEPRECATED = {
         summary: "detects uses of deprecated items",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.16"),
         default_level: Level::Warn,
     }
 }
@@ -313,7 +320,7 @@ declare_lint! {
     /// ```
     pub(crate) static DUPLICATE_BASE = {
         summary: "detects class definitions with duplicate bases",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -345,7 +352,7 @@ declare_lint! {
     /// ```
     pub(crate) static DUPLICATE_KW_ONLY = {
         summary: "detects dataclass definitions with more than one usage of `KW_ONLY`",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.12"),
         default_level: Level::Error,
     }
 }
@@ -427,7 +434,7 @@ declare_lint! {
     /// [Method Resolution Order]: https://docs.python.org/3/glossary.html#term-method-resolution-order
     pub(crate) static INSTANCE_LAYOUT_CONFLICT = {
         summary: "detects class definitions that raise `TypeError` due to instance layout conflict",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.12"),
         default_level: Level::Error,
     }
 }
@@ -455,11 +462,12 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_PROTOCOL = {
         summary: "detects invalid protocol class definitions",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
 
+// Added in #17750.
 declare_lint! {
     /// ## What it does
     /// Checks for protocol classes with members that will lead to ambiguous interfaces.
@@ -490,7 +498,7 @@ declare_lint! {
     /// ```
     pub(crate) static AMBIGUOUS_PROTOCOL_MEMBER = {
         summary: "detects protocol classes with ambiguous interfaces",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.20"),
         default_level: Level::Warn,
     }
 }
@@ -516,7 +524,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_NAMED_TUPLE = {
         summary: "detects invalid `NamedTuple` class definitions",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.19"),
         default_level: Level::Error,
     }
 }
@@ -540,7 +548,7 @@ declare_lint! {
     /// [method resolution order]: https://docs.python.org/3/glossary.html#term-method-resolution-order
     pub(crate) static INCONSISTENT_MRO = {
         summary: "detects class definitions with an inconsistent MRO",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -560,17 +568,22 @@ declare_lint! {
     /// ```
     pub(crate) static INDEX_OUT_OF_BOUNDS = {
         summary: "detects index out of bounds errors",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
 
+// Added in #19763.
 declare_lint! {
     /// ## What it does
-    /// Checks for subscript accesses with invalid keys.
+    /// Checks for subscript accesses with invalid keys and `TypedDict` construction with an
+    /// unknown key.
     ///
     /// ## Why is this bad?
-    /// Using an invalid key will raise a `KeyError` at runtime.
+    /// Subscripting with an invalid key will raise a `KeyError` at runtime.
+    ///
+    /// Creating a `TypedDict` with an unknown key is likely a mistake; if the `TypedDict` is
+    /// `closed=true` it also violates the expectations of the type.
     ///
     /// ## Examples
     /// ```python
@@ -582,10 +595,14 @@ declare_lint! {
     ///
     /// alice = Person(name="Alice", age=30)
     /// alice["height"]  # KeyError: 'height'
+    ///
+    /// bob: Person = { "name": "Bob", "age": 30 }  # typo!
+    ///
+    /// carol = Person(name="Carol", age=25)  # typo!
     /// ```
     pub(crate) static INVALID_KEY = {
-        summary: "detects invalid subscript accesses",
-        status: LintStatus::preview("1.0.0"),
+        summary: "detects invalid subscript accesses or TypedDict literal keys",
+        status: LintStatus::stable("0.0.1-alpha.17"),
         default_level: Level::Error,
     }
 }
@@ -606,7 +623,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_ARGUMENT_TYPE = {
         summary: "detects call arguments whose type is not assignable to the corresponding typed parameter",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -625,7 +642,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_RETURN_TYPE = {
         summary: "detects returned values that can't be assigned to the function's annotated return type",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -647,7 +664,7 @@ declare_lint! {
     /// [assignable to]: https://typing.python.org/en/latest/spec/glossary.html#term-assignable
     pub(crate) static INVALID_ASSIGNMENT = {
         summary: "detects invalid assignments",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -677,7 +694,7 @@ declare_lint! {
     /// [Awaitable]: https://docs.python.org/3/library/collections.abc.html#collections.abc.Awaitable
     pub(crate) static INVALID_AWAIT = {
         summary: "detects awaiting on types that don't support it",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.19"),
         default_level: Level::Error,
     }
 }
@@ -695,7 +712,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_BASE = {
         summary: "detects class bases that will cause the class definition to raise an exception at runtime",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -728,7 +745,7 @@ declare_lint! {
     /// [method resolution order]: https://docs.python.org/3/glossary.html#term-method-resolution-order
     pub(crate) static UNSUPPORTED_BASE = {
         summary: "detects class bases that are unsupported as ty could not feasibly calculate the class's MRO",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.7"),
         default_level: Level::Warn,
     }
 }
@@ -749,7 +766,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_CONTEXT_MANAGER = {
         summary: "detects expressions used in with statements that don't implement the context manager protocol",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -772,7 +789,7 @@ declare_lint! {
     /// [assignable to]: https://typing.python.org/en/latest/spec/glossary.html#term-assignable
     pub(crate) static INVALID_DECLARATION = {
         summary: "detects invalid declarations",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -808,7 +825,7 @@ declare_lint! {
     ///  This rule corresponds to Ruff's [`except-with-non-exception-classes` (`B030`)](https://docs.astral.sh/ruff/rules/except-with-non-exception-classes)
     pub(crate) static INVALID_EXCEPTION_CAUGHT = {
         summary: "detects exception handlers that catch classes that do not inherit from `BaseException`",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -834,7 +851,7 @@ declare_lint! {
     /// - [Typing spec: Generics](https://typing.python.org/en/latest/spec/generics.html#introduction)
     pub(crate) static INVALID_GENERIC_CLASS = {
         summary: "detects invalid generic classes",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -862,7 +879,31 @@ declare_lint! {
     /// - [Typing spec: Generics](https://typing.python.org/en/latest/spec/generics.html#introduction)
     pub(crate) static INVALID_LEGACY_TYPE_VARIABLE = {
         summary: "detects invalid legacy type variables",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Checks for the creation of invalid `ParamSpec`s
+    ///
+    /// ## Why is this bad?
+    /// There are several requirements that you must follow when creating a `ParamSpec`.
+    ///
+    /// ## Examples
+    /// ```python
+    /// from typing import ParamSpec
+    ///
+    /// P1 = ParamSpec("P1")  # okay
+    /// P2 = ParamSpec("S2")  # error: ParamSpec name must match the variable it's assigned to
+    /// ```
+    ///
+    /// ## References
+    /// - [Typing spec: ParamSpec](https://typing.python.org/en/latest/spec/generics.html#paramspec)
+    pub(crate) static INVALID_PARAMSPEC = {
+        summary: "detects invalid ParamSpec usage",
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -883,6 +924,30 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_TYPE_ALIAS_TYPE = {
         summary: "detects invalid TypeAliasType definitions",
+        status: LintStatus::stable("0.0.1-alpha.6"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Checks for the creation of invalid `NewType`s
+    ///
+    /// ## Why is this bad?
+    /// There are several requirements that you must follow when creating a `NewType`.
+    ///
+    /// ## Examples
+    /// ```python
+    /// from typing import NewType
+    ///
+    /// def get_name() -> str: ...
+    ///
+    /// Foo = NewType("Foo", int)        # okay
+    /// Bar = NewType(get_name(), int)   # error: The first argument to `NewType` must be a string literal
+    /// Baz = NewType("Baz", int | str)  # error: invalid base for `typing.NewType`
+    /// ```
+    pub(crate) static INVALID_NEWTYPE = {
+        summary: "detects invalid NewType definitions",
         status: LintStatus::preview("1.0.0"),
         default_level: Level::Error,
     }
@@ -910,7 +975,7 @@ declare_lint! {
     /// - [Python documentation: Metaclasses](https://docs.python.org/3/reference/datamodel.html#metaclasses)
     pub(crate) static INVALID_METACLASS = {
         summary: "detects invalid `metaclass=` arguments",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -953,8 +1018,64 @@ declare_lint! {
     /// - [Python documentation: `@overload`](https://docs.python.org/3/library/typing.html#typing.overload)
     pub(crate) static INVALID_OVERLOAD = {
         summary: "detects invalid `@overload` usages",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Checks for various `@overload`-decorated functions that have non-stub bodies.
+    ///
+    /// ## Why is this bad?
+    /// Functions decorated with `@overload` are ignored at runtime; they are overridden
+    /// by the implementation function that follows the series of overloads. While it is
+    /// not illegal to provide a body for an `@overload`-decorated function, it may indicate
+    /// a misunderstanding of how the `@overload` decorator works.
+    ///
+    /// ## Example
+    ///
+    /// ```py
+    /// from typing import overload
+    ///
+    /// @overload
+    /// def foo(x: int) -> int:
+    ///     return x + 1  # will never be executed
+    ///
+    /// @overload
+    /// def foo(x: str) -> str:
+    ///     return "Oh no, got a string"  # will never be executed
+    ///
+    /// def foo(x: int | str) -> int | str:
+    ///     raise Exception("unexpected type encountered")
+    /// ```
+    ///
+    /// Use instead:
+    ///
+    /// ```py
+    /// from typing import assert_never, overload
+    ///
+    /// @overload
+    /// def foo(x: int) -> int: ...
+    ///
+    /// @overload
+    /// def foo(x: str) -> str: ...
+    ///
+    /// def foo(x: int | str) -> int | str:
+    ///     if isinstance(x, int):
+    ///         return x + 1
+    ///     elif isinstance(x, str):
+    ///         return "Oh no, got a string"
+    ///     else:
+    ///         assert_never(x)
+    /// ```
+    ///
+    /// ## References
+    /// - [Python documentation: `@overload`](https://docs.python.org/3/library/typing.html#typing.overload)
+    pub(crate) static USELESS_OVERLOAD_BODY = {
+        summary: "detects `@overload`-decorated functions with non-stub bodies",
+        status: LintStatus::stable("0.0.1-alpha.22"),
+        default_level: Level::Warn,
     }
 }
 
@@ -973,7 +1094,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_PARAMETER_DEFAULT = {
         summary: "detects default values that can't be assigned to the parameter's annotated type",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1016,7 +1137,7 @@ declare_lint! {
     /// - [Python documentation: Built-in Exceptions](https://docs.python.org/3/library/exceptions.html#built-in-exceptions)
     pub(crate) static INVALID_RAISE = {
         summary: "detects `raise` statements that raise invalid exceptions or use invalid causes",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1055,7 +1176,7 @@ declare_lint! {
     /// - [Python documentation: super()](https://docs.python.org/3/library/functions.html#super)
     pub(crate) static INVALID_SUPER_ARGUMENT = {
         summary: "detects invalid arguments for `super()`",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1079,7 +1200,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_TYPE_CHECKING_CONSTANT = {
         summary: "detects invalid `TYPE_CHECKING` constant assignments",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1103,7 +1224,7 @@ declare_lint! {
     /// [type expressions]: https://typing.python.org/en/latest/spec/annotations.html#type-and-annotation-expressions
     pub(crate) static INVALID_TYPE_FORM = {
         summary: "detects invalid type forms",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1131,7 +1252,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_TYPE_GUARD_DEFINITION = {
         summary: "detects malformed type guard functions",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.11"),
         default_level: Level::Error,
     }
 }
@@ -1159,7 +1280,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_TYPE_GUARD_CALL = {
         summary: "detects type guard function calls that has no narrowing effect",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.11"),
         default_level: Level::Error,
     }
 }
@@ -1188,7 +1309,7 @@ declare_lint! {
     /// [type variables]: https://docs.python.org/3/library/typing.html#typing.TypeVar
     pub(crate) static INVALID_TYPE_VARIABLE_CONSTRAINTS = {
         summary: "detects invalid type variable constraints",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1207,7 +1328,7 @@ declare_lint! {
     /// ```
     pub(crate) static MISSING_ARGUMENT = {
         summary: "detects missing required arguments in a call",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1230,7 +1351,7 @@ declare_lint! {
     /// ```
     pub(crate) static NO_MATCHING_OVERLOAD = {
         summary: "detects calls that do not match any overload",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1248,7 +1369,7 @@ declare_lint! {
     /// ```
     pub(crate) static NON_SUBSCRIPTABLE = {
         summary: "detects subscripting objects that do not support subscripting",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1268,7 +1389,7 @@ declare_lint! {
     /// ```
     pub(crate) static NOT_ITERABLE = {
         summary: "detects iteration over an object that is not iterable",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1299,7 +1420,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNSUPPORTED_BOOL_CONVERSION = {
         summary: "detects boolean conversion where the object incorrectly implements `__bool__`",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1320,7 +1441,7 @@ declare_lint! {
     /// ```
     pub(crate) static PARAMETER_ALREADY_ASSIGNED = {
         summary: "detects multiple arguments for the same parameter",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1342,7 +1463,7 @@ declare_lint! {
     /// ```
     pub(crate) static POSSIBLY_MISSING_ATTRIBUTE = {
         summary: "detects references to possibly missing attributes",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.22"),
         default_level: Level::Warn,
     }
 }
@@ -1368,7 +1489,7 @@ declare_lint! {
     /// ```
     pub(crate) static POSSIBLY_MISSING_IMPORT = {
         summary: "detects possibly missing imports",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.22"),
         default_level: Level::Warn,
     }
 }
@@ -1390,7 +1511,7 @@ declare_lint! {
     /// ```
     pub(crate) static POSSIBLY_UNRESOLVED_REFERENCE = {
         summary: "detects references to possibly undefined names",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Ignore,
     }
 }
@@ -1413,7 +1534,7 @@ declare_lint! {
     /// ```
     pub(crate) static SUBCLASS_OF_FINAL_CLASS = {
         summary: "detects subclasses of final classes",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1435,7 +1556,7 @@ declare_lint! {
     /// ```
     pub(crate) static TYPE_ASSERTION_FAILURE = {
         summary: "detects failed type assertions",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1456,7 +1577,7 @@ declare_lint! {
     /// ```
     pub(crate) static TOO_MANY_POSITIONAL_ARGUMENTS = {
         summary: "detects calls passing too many positional arguments",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1495,7 +1616,7 @@ declare_lint! {
     /// - [Python documentation: super()](https://docs.python.org/3/library/functions.html#super)
     pub(crate) static UNAVAILABLE_IMPLICIT_SUPER_ARGUMENTS = {
         summary: "detects invalid `super()` calls where implicit arguments are unavailable.",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1511,9 +1632,9 @@ declare_lint! {
     /// ```python
     /// reveal_type(1)  # NameError: name 'reveal_type' is not defined
     /// ```
-    pub(crate) static UNDEFINED_REVEAL = {
+    pub static UNDEFINED_REVEAL = {
         summary: "detects usages of `reveal_type` without importing it",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Warn,
     }
 }
@@ -1534,7 +1655,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNKNOWN_ARGUMENT = {
         summary: "detects unknown keyword arguments in calls",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1555,7 +1676,7 @@ declare_lint! {
     /// ```
     pub(crate) static POSITIONAL_ONLY_PARAMETER_AS_KWARG = {
         summary: "detects positional-only parameters passed as keyword arguments",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.22"),
         default_level: Level::Error,
     }
 }
@@ -1577,7 +1698,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNRESOLVED_ATTRIBUTE = {
         summary: "detects references to unresolved attributes",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1596,7 +1717,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNRESOLVED_IMPORT = {
         summary: "detects unresolved imports",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1615,7 +1736,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNRESOLVED_REFERENCE = {
         summary: "detects references to names that are not defined",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1637,7 +1758,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNSUPPORTED_OPERATOR = {
         summary: "detects binary, unary, or comparison expressions where the operands don't support the operator",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1656,7 +1777,7 @@ declare_lint! {
     /// ```
     pub(crate) static ZERO_STEPSIZE_IN_SLICE = {
         summary: "detects a slice step size of zero",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1680,7 +1801,7 @@ declare_lint! {
     /// ```
     pub(crate) static STATIC_ASSERT_ERROR = {
         summary: "Failed static assertion",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1708,7 +1829,7 @@ declare_lint! {
     /// ```
     pub(crate) static INVALID_ATTRIBUTE_ACCESS = {
         summary: "Invalid attribute access",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Error,
     }
 }
@@ -1729,7 +1850,7 @@ declare_lint! {
     /// ```
     pub(crate) static REDUNDANT_CAST = {
         summary: "detects redundant `cast` calls",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Warn,
     }
 }
@@ -1755,6 +1876,7 @@ declare_lint! {
     /// ```
     ///
     /// Use instead:
+    ///
     /// ```python
     /// x: int
     ///
@@ -1767,6 +1889,7 @@ declare_lint! {
     /// ```
     ///
     /// Or:
+    ///
     /// ```python
     /// x: int | None = None
     ///
@@ -1779,7 +1902,7 @@ declare_lint! {
     /// ```
     pub(crate) static UNRESOLVED_GLOBAL = {
         summary: "detects `global` statements with no definition in the global scope",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.15"),
         default_level: Level::Warn,
     }
 }
@@ -1806,7 +1929,7 @@ declare_lint! {
     /// ```
     pub(crate) static MISSING_TYPED_DICT_KEY = {
         summary: "detects missing required keys in `TypedDict` constructors",
-        status: LintStatus::preview("1.0.0"),
+        status: LintStatus::stable("0.0.1-alpha.20"),
         default_level: Level::Error,
     }
 }
@@ -1912,7 +2035,7 @@ pub(super) fn report_index_out_of_bounds(
 /// Emit a diagnostic declaring that a type does not support subscripting.
 pub(super) fn report_non_subscriptable(
     context: &InferContext,
-    node: AnyNodeRef,
+    node: &ast::ExprSubscript,
     non_subscriptable_ty: Type,
     method: &str,
 ) {
@@ -1929,18 +2052,30 @@ pub(super) fn report_slice_step_size_zero(context: &InferContext, node: AnyNodeR
     let Some(builder) = context.report_lint(&ZERO_STEPSIZE_IN_SLICE, node) else {
         return;
     };
-    builder.into_diagnostic("Slice step size can not be zero");
+    builder.into_diagnostic("Slice step size cannot be zero");
 }
 
-fn report_invalid_assignment_with_message(
-    context: &InferContext,
-    node: AnyNodeRef,
+// We avoid emitting invalid assignment diagnostic for literal assignments to a `TypedDict`, as
+// they can only occur if we already failed to validate the dict (and emitted some diagnostic).
+pub(crate) fn is_invalid_typed_dict_literal(
+    db: &dyn Db,
     target_ty: Type,
+    source: AnyNodeRef<'_>,
+) -> bool {
+    target_ty
+        .filter_union(db, Type::is_typed_dict)
+        .as_typed_dict()
+        .is_some()
+        && matches!(source, AnyNodeRef::ExprDict(_))
+}
+
+fn report_invalid_assignment_with_message<'db, 'ctx: 'db, T: Ranged>(
+    context: &'ctx InferContext,
+    node: T,
+    target_ty: Type<'db>,
     message: std::fmt::Arguments,
-) {
-    let Some(builder) = context.report_lint(&INVALID_ASSIGNMENT, node) else {
-        return;
-    };
+) -> Option<LintDiagnosticGuard<'db, 'ctx>> {
+    let builder = context.report_lint(&INVALID_ASSIGNMENT, node)?;
     match target_ty {
         Type::ClassLiteral(class) => {
             let mut diag = builder.into_diagnostic(format_args!(
@@ -1948,6 +2083,7 @@ fn report_invalid_assignment_with_message(
                 class.name(context.db()),
             ));
             diag.info("Annotate to make it explicit if this is intentional");
+            Some(diag)
         }
         Type::FunctionLiteral(function) => {
             let mut diag = builder.into_diagnostic(format_args!(
@@ -1955,41 +2091,106 @@ fn report_invalid_assignment_with_message(
                 function.name(context.db()),
             ));
             diag.info("Annotate to make it explicit if this is intentional");
+            Some(diag)
         }
+
         _ => {
-            builder.into_diagnostic(message);
+            let diag = builder.into_diagnostic(message);
+            Some(diag)
         }
     }
 }
 
 pub(super) fn report_invalid_assignment<'db>(
     context: &InferContext<'db, '_>,
-    node: AnyNodeRef,
+    target_node: AnyNodeRef,
     definition: Definition<'db>,
     target_ty: Type,
-    mut source_ty: Type<'db>,
+    mut value_ty: Type<'db>,
 ) {
-    let settings =
-        DisplaySettings::from_possibly_ambiguous_type_pair(context.db(), target_ty, source_ty);
+    let definition_kind = definition.kind(context.db());
+    let value_node = match definition_kind {
+        DefinitionKind::Assignment(def) => Some(def.value(context.module())),
+        DefinitionKind::AnnotatedAssignment(def) => def.value(context.module()),
+        DefinitionKind::NamedExpression(def) => Some(&*def.node(context.module()).value),
+        _ => None,
+    };
 
-    if let DefinitionKind::AnnotatedAssignment(annotated_assignment) = definition.kind(context.db())
-        && let Some(value) = annotated_assignment.value(context.module())
+    if let Some(value_node) = value_node
+        && is_invalid_typed_dict_literal(context.db(), target_ty, value_node.into())
     {
-        // Re-infer the RHS of the annotated assignment, ignoring the type context, for more precise
-        // error messages.
-        source_ty = infer_isolated_expression(context.db(), definition.scope(context.db()), value);
+        return;
     }
 
-    report_invalid_assignment_with_message(
+    let settings =
+        DisplaySettings::from_possibly_ambiguous_type_pair(context.db(), target_ty, value_ty);
+
+    if let Some(value_node) = value_node {
+        // Re-infer the RHS of the annotated assignment, ignoring the type context for more precise
+        // error messages.
+        value_ty =
+            infer_isolated_expression(context.db(), definition.scope(context.db()), value_node);
+    }
+
+    let diagnostic_range = if let Some(value_node) = value_node {
+        // Expand the range to include parentheses around the value, if any. This allows
+        // invalid-assignment diagnostics to be suppressed on the opening or closing parenthesis:
+        // ```py
+        // x: str = ( # ty: ignore <- here
+        //     1 + 2 + 3
+        // )  # ty: ignore <- or here
+        // ```
+
+        let comment_ranges = CommentRanges::from(context.module().tokens());
+        let source = source_text(context.db(), context.file());
+        parentheses_iterator(value_node.into(), None, &comment_ranges, &source)
+            .last()
+            .unwrap_or(value_node.range())
+    } else {
+        target_node.range()
+    };
+
+    let Some(mut diag) = report_invalid_assignment_with_message(
         context,
-        node,
+        diagnostic_range,
         target_ty,
         format_args!(
             "Object of type `{}` is not assignable to `{}`",
-            source_ty.display_with(context.db(), settings.clone()),
+            value_ty.display_with(context.db(), settings.clone()),
             target_ty.display_with(context.db(), settings)
         ),
-    );
+    ) else {
+        return;
+    };
+
+    if value_node.is_some() {
+        match definition_kind {
+            DefinitionKind::AnnotatedAssignment(assignment) => {
+                // For annotated assignments, just point to the annotation in the source code.
+                diag.annotate(
+                    context
+                        .secondary(assignment.annotation(context.module()))
+                        .message("Declared type"),
+                );
+            }
+            _ => {
+                // Otherwise, annotate the target with its declared type.
+                diag.annotate(context.secondary(target_node).message(format_args!(
+                    "Declared type `{}`",
+                    target_ty.display(context.db()),
+                )));
+            }
+        }
+
+        diag.set_primary_message(format_args!(
+            "Incompatible value of type `{}`",
+            value_ty.display(context.db()),
+        ));
+
+        // Overwrite the concise message to avoid showing the value type twice
+        let message = diag.primary_message().to_string();
+        diag.set_concise_message(message);
+    }
 }
 
 pub(super) fn report_invalid_attribute_assignment(
@@ -1999,6 +2200,11 @@ pub(super) fn report_invalid_attribute_assignment(
     source_ty: Type,
     attribute_name: &'_ str,
 ) {
+    // TODO: Ideally we would not emit diagnostics for `TypedDict` literal arguments
+    // here (see `diagnostic::is_invalid_typed_dict_literal`). However, we may have
+    // silenced diagnostics during attribute resolution, and rely on the assignability
+    // diagnostic being emitted here.
+
     report_invalid_assignment_with_message(
         context,
         node,
@@ -2206,42 +2412,129 @@ pub(super) fn report_possibly_missing_attribute(
     let Some(builder) = context.report_lint(&POSSIBLY_MISSING_ATTRIBUTE, target) else {
         return;
     };
-    builder.into_diagnostic(format_args!(
-        "Attribute `{attribute}` on type `{}` may be missing",
-        object_ty.display(context.db()),
-    ));
+    let db = context.db();
+    match object_ty {
+        Type::ModuleLiteral(module) => builder.into_diagnostic(format_args!(
+            "Member `{attribute}` may be missing on module `{}`",
+            module.module(db).name(db),
+        )),
+        Type::ClassLiteral(class) => builder.into_diagnostic(format_args!(
+            "Attribute `{attribute}` may be missing on class `{}`",
+            class.name(db),
+        )),
+        Type::GenericAlias(alias) => builder.into_diagnostic(format_args!(
+            "Attribute `{attribute}` may be missing on class `{}`",
+            alias.display(db),
+        )),
+        _ => builder.into_diagnostic(format_args!(
+            "Attribute `{attribute}` may be missing on object of type `{}`",
+            object_ty.display(db),
+        )),
+    };
+}
+
+pub(super) fn report_invalid_exception_tuple_caught<'db, 'ast>(
+    context: &InferContext<'db, 'ast>,
+    node: &'ast ast::ExprTuple,
+    invalid_tuple_nodes: impl IntoIterator<Item = (&'ast ast::Expr, Type<'db>)>,
+) {
+    let Some(builder) = context.report_lint(&INVALID_EXCEPTION_CAUGHT, node) else {
+        return;
+    };
+
+    let mut diagnostic = builder.into_diagnostic("Invalid tuple caught in an exception handler");
+
+    for (sub_node, ty) in invalid_tuple_nodes {
+        let span = context.span(sub_node);
+        diagnostic.annotate(Annotation::secondary(span.clone()).message(format_args!(
+            "Invalid element of type `{}`",
+            ty.display(context.db())
+        )));
+        if ty.is_notimplemented(context.db()) {
+            diagnostic.annotate(
+                Annotation::secondary(span).message("Did you mean `NotImplementedError`?"),
+            );
+        }
+    }
+
+    diagnostic.info(
+        "Can only catch a subclass of `BaseException` or tuple of `BaseException` subclasses",
+    );
 }
 
 pub(super) fn report_invalid_exception_caught(context: &InferContext, node: &ast::Expr, ty: Type) {
     let Some(builder) = context.report_lint(&INVALID_EXCEPTION_CAUGHT, node) else {
         return;
     };
-    builder.into_diagnostic(format_args!(
-        "Cannot catch object of type `{}` in an exception handler \
-            (must be a `BaseException` subclass or a tuple of `BaseException` subclasses)",
-        ty.display(context.db())
-    ));
+
+    let mut diagnostic = if ty.is_notimplemented(context.db()) {
+        let mut diag =
+            builder.into_diagnostic("Cannot catch `NotImplemented` in an exception handler");
+        diag.set_primary_message("Did you mean `NotImplementedError`?");
+        diag
+    } else {
+        let mut diag = builder.into_diagnostic(format_args!(
+            "Invalid {thing} caught in an exception handler",
+            thing = if ty.tuple_instance_spec(context.db()).is_some() {
+                "tuple"
+            } else {
+                "object"
+            },
+        ));
+        diag.set_primary_message(format_args!(
+            "Object has type `{}`",
+            ty.display(context.db())
+        ));
+        diag
+    };
+
+    diagnostic.info(
+        "Can only catch a subclass of `BaseException` or tuple of `BaseException` subclasses",
+    );
 }
 
-pub(crate) fn report_invalid_exception_raised(context: &InferContext, node: &ast::Expr, ty: Type) {
-    let Some(builder) = context.report_lint(&INVALID_RAISE, node) else {
+pub(crate) fn report_invalid_exception_raised(
+    context: &InferContext,
+    raised_node: &ast::Expr,
+    raise_type: Type,
+) {
+    let Some(builder) = context.report_lint(&INVALID_RAISE, raised_node) else {
         return;
     };
-    builder.into_diagnostic(format_args!(
-        "Cannot raise object of type `{}` (must be a `BaseException` subclass or instance)",
-        ty.display(context.db())
-    ));
+    if raise_type.is_notimplemented(context.db()) {
+        let mut diagnostic =
+            builder.into_diagnostic(format_args!("Cannot raise `NotImplemented`",));
+        diagnostic.set_primary_message("Did you mean `NotImplementedError`?");
+        diagnostic.info("Can only raise an instance or subclass of `BaseException`");
+    } else {
+        let mut diagnostic = builder.into_diagnostic(format_args!(
+            "Cannot raise object of type `{}`",
+            raise_type.display(context.db())
+        ));
+        diagnostic.set_primary_message("Not an instance or subclass of `BaseException`");
+    }
 }
 
 pub(crate) fn report_invalid_exception_cause(context: &InferContext, node: &ast::Expr, ty: Type) {
     let Some(builder) = context.report_lint(&INVALID_RAISE, node) else {
         return;
     };
-    builder.into_diagnostic(format_args!(
-        "Cannot use object of type `{}` as exception cause \
-         (must be a `BaseException` subclass or instance or `None`)",
-        ty.display(context.db())
-    ));
+    let mut diagnostic = if ty.is_notimplemented(context.db()) {
+        let mut diag = builder.into_diagnostic(format_args!(
+            "Cannot use `NotImplemented` as an exception cause",
+        ));
+        diag.set_primary_message("Did you mean `NotImplementedError`?");
+        diag
+    } else {
+        builder.into_diagnostic(format_args!(
+            "Cannot use object of type `{}` as an exception cause",
+            ty.display(context.db())
+        ))
+    };
+    diagnostic.info(
+        "An exception cause must be an instance of `BaseException`, \
+        subclass of `BaseException`, or `None`",
+    );
 }
 
 pub(crate) fn report_instance_layout_conflict(
@@ -2625,6 +2918,12 @@ pub(crate) fn report_undeclared_protocol_member(
                 SubclassOfInner::Dynamic(_) => return false,
             },
             Type::NominalInstance(instance) => instance.class(db),
+            Type::Union(union) => {
+                return union
+                    .elements(db)
+                    .iter()
+                    .all(|elem| should_give_hint(db, *elem));
+            }
             _ => return false,
         };
 
@@ -2656,9 +2955,7 @@ pub(crate) fn report_undeclared_protocol_member(
     if definition.kind(db).is_unannotated_assignment() {
         let binding_type = binding_type(db, definition);
 
-        let suggestion = binding_type
-            .literal_promotion_type(db)
-            .unwrap_or(binding_type);
+        let suggestion = binding_type.promote_literals(db, TypeContext::default());
 
         if should_give_hint(db, suggestion) {
             diagnostic.set_primary_message(format_args!(
@@ -2752,6 +3049,24 @@ pub(crate) fn report_invalid_or_unsupported_base(
         return;
     }
 
+    if let Type::KnownInstance(KnownInstanceType::NewType(newtype)) = base_type {
+        let Some(builder) = context.report_lint(&INVALID_BASE, base_node) else {
+            return;
+        };
+        let mut diagnostic = builder.into_diagnostic("Cannot subclass an instance of NewType");
+        diagnostic.info(format_args!(
+            "Perhaps you were looking for: `{} = NewType('{}', {})`",
+            class.name(context.db()),
+            class.name(context.db()),
+            newtype.name(context.db()),
+        ));
+        diagnostic.info(format_args!(
+            "Definition of class `{}` will raise `TypeError` at runtime",
+            class.name(context.db())
+        ));
+        return;
+    }
+
     let tuple_of_types = Type::homogeneous_tuple(db, instance_of_type);
 
     let explain_mro_entries = |diagnostic: &mut LintDiagnosticGuard| {
@@ -2765,6 +3080,7 @@ pub(crate) fn report_invalid_or_unsupported_base(
         db,
         "__mro_entries__",
         CallArguments::positional([tuple_of_types]),
+        TypeContext::default(),
     ) {
         Ok(ret) => {
             if ret.return_type(db).is_assignable_to(db, tuple_of_types) {
@@ -2872,8 +3188,9 @@ pub(crate) fn report_invalid_key_on_typed_dict<'db>(
     typed_dict_node: AnyNodeRef,
     key_node: AnyNodeRef,
     typed_dict_ty: Type<'db>,
+    full_object_ty: Option<Type<'db>>,
     key_ty: Type<'db>,
-    items: &FxOrderMap<Name, Field<'db>>,
+    items: &FxIndexMap<Name, Field<'db>>,
 ) {
     let db = context.db();
     if let Some(builder) = context.report_lint(&INVALID_KEY, key_node) {
@@ -2883,34 +3200,58 @@ pub(crate) fn report_invalid_key_on_typed_dict<'db>(
                 let typed_dict_name = typed_dict_ty.display(db);
 
                 let mut diagnostic = builder.into_diagnostic(format_args!(
-                    "Invalid key access on TypedDict `{typed_dict_name}`",
+                    "Unknown key \"{key}\" for TypedDict `{typed_dict_name}`",
                 ));
 
-                diagnostic.annotate(
+                diagnostic.annotate(if let Some(full_object_ty) = full_object_ty {
+                    context.secondary(typed_dict_node).message(format_args!(
+                        "TypedDict `{typed_dict_name}` in {kind} type `{full_object_ty}`",
+                        kind = if full_object_ty.is_union() {
+                            "union"
+                        } else {
+                            "intersection"
+                        },
+                        full_object_ty = full_object_ty.display(db)
+                    ))
+                } else {
                     context
                         .secondary(typed_dict_node)
-                        .message(format_args!("TypedDict `{typed_dict_name}`")),
-                );
+                        .message(format_args!("TypedDict `{typed_dict_name}`"))
+                });
 
-                let existing_keys = items.iter().map(|(name, _)| name.as_str());
-
-                diagnostic.set_primary_message(format!(
-                    "Unknown key \"{key}\"{hint}",
-                    hint = if let Some(suggestion) = did_you_mean(existing_keys, key) {
-                        format!(" - did you mean \"{suggestion}\"?")
+                let existing_keys = items.keys();
+                if let Some(suggestion) = did_you_mean(existing_keys, key) {
+                    if key_node.is_expr_string_literal() {
+                        diagnostic
+                            .set_primary_message(format_args!("Did you mean \"{suggestion}\"?"));
                     } else {
-                        String::new()
+                        diagnostic.set_primary_message(format_args!(
+                            "Unknown key \"{key}\" - did you mean \"{suggestion}\"?",
+                        ));
                     }
+                    diagnostic.set_concise_message(format_args!(
+                        "Unknown key \"{key}\" for TypedDict `{typed_dict_name}` - did you mean \"{suggestion}\"?",
+                    ));
+                } else {
+                    diagnostic.set_primary_message(format_args!("Unknown key \"{key}\""));
+                }
+            }
+            _ => {
+                let mut diagnostic = builder.into_diagnostic(format_args!(
+                    "TypedDict `{}` can only be subscripted with a string literal key, \
+                     got key of type `{}`",
+                    typed_dict_ty.display(db),
+                    key_ty.display(db),
                 ));
 
-                diagnostic
+                if let Some(full_object_ty) = full_object_ty {
+                    diagnostic.info(format_args!(
+                        "The full type of the subscripted object is `{}`",
+                        full_object_ty.display(db)
+                    ));
+                }
             }
-            _ => builder.into_diagnostic(format_args!(
-                "TypedDict `{}` cannot be indexed with a key of type `{}`",
-                typed_dict_ty.display(db),
-                key_ty.display(db),
-            )),
-        };
+        }
     }
 }
 
@@ -2993,6 +3334,39 @@ pub(crate) fn report_cannot_pop_required_field_on_typed_dict<'db>(
     }
 }
 
+pub(crate) fn report_rebound_typevar<'db>(
+    context: &InferContext<'db, '_>,
+    typevar_name: &ast::name::Name,
+    class: ClassLiteral<'db>,
+    class_node: &ast::StmtClassDef,
+    other_typevar: BoundTypeVarInstance<'db>,
+) {
+    let db = context.db();
+    let Some(builder) = context.report_lint(&INVALID_GENERIC_CLASS, class.header_range(db)) else {
+        return;
+    };
+    let mut diagnostic = builder.into_diagnostic(format_args!(
+        "Generic class `{}` must not reference type variables bound in an enclosing scope",
+        class_node.name,
+    ));
+    diagnostic.set_primary_message(format_args!(
+        "`{typevar_name}` referenced in class definition here"
+    ));
+    let Some(other_definition) = other_typevar.binding_context(db).definition() else {
+        return;
+    };
+    let span = match binding_type(db, other_definition) {
+        Type::ClassLiteral(class) => Some(class.header_span(db)),
+        Type::FunctionLiteral(function) => function.spans(db).map(|spans| spans.signature),
+        _ => return,
+    };
+    if let Some(span) = span {
+        diagnostic.annotate(Annotation::secondary(span).message(format_args!(
+            "Type variable `{typevar_name}` is bound in this enclosing scope",
+        )));
+    }
+}
+
 /// This function receives an unresolved `from foo import bar` import,
 /// where `foo` can be resolved to a module but that module does not
 /// have a `bar` member or submodule.
@@ -3041,28 +3415,52 @@ pub(super) fn hint_if_stdlib_submodule_exists_on_other_versions(
     add_inferred_python_version_hint_to_diagnostic(db, &mut diagnostic, "resolving modules");
 }
 
-/// Suggest a name from `existing_names` that is similar to `wrong_name`.
-fn did_you_mean<S: AsRef<str>, T: AsRef<str>>(
-    existing_names: impl Iterator<Item = S>,
-    wrong_name: T,
-) -> Option<String> {
-    if wrong_name.as_ref().len() < 3 {
-        return None;
+/// This function receives an unresolved `foo.bar` attribute access,
+/// where `foo` can be resolved to have a type but that type does not
+/// have a `bar` attribute.
+///
+/// If the type of `foo` has a definition that originates in the
+/// standard library and `foo.bar` *does* exist as an attribute on *other*
+/// Python versions, we add a hint to the diagnostic that the user may have
+/// misconfigured their Python version.
+pub(super) fn hint_if_stdlib_attribute_exists_on_other_versions(
+    db: &dyn Db,
+    mut diagnostic: LintDiagnosticGuard,
+    value_type: &Type,
+    attr: &Identifier,
+) {
+    // Currently we limit this analysis to attributes of stdlib modules,
+    // as this covers the most important cases while not being too noisy
+    // about basic typos or special types like `super(C, self)`
+    let Type::ModuleLiteral(module_ty) = value_type else {
+        return;
+    };
+    let module = module_ty.module(db);
+    let Some(file) = module.file(db) else {
+        return;
+    };
+    let Some(search_path) = module.search_path(db) else {
+        return;
+    };
+    if !search_path.is_standard_library() {
+        return;
     }
 
-    existing_names
-        .filter(|ref id| id.as_ref().len() >= 2)
-        .map(|ref id| {
-            (
-                id.as_ref().to_string(),
-                strsim::damerau_levenshtein(
-                    &id.as_ref().to_lowercase(),
-                    &wrong_name.as_ref().to_lowercase(),
-                ),
-            )
-        })
-        .min_by_key(|(_, dist)| *dist)
-        // Heuristic to filter out bad matches
-        .filter(|(_, dist)| *dist <= 3)
-        .map(|(id, _)| id)
+    // We populate place_table entries for stdlib items across all known versions and platforms,
+    // so if this lookup succeeds then we know that this lookup *could* succeed with possible
+    // configuration changes.
+    let symbol_table = place_table(db, global_scope(db, file));
+    if symbol_table.symbol_by_name(attr).is_none() {
+        return;
+    }
+
+    // For now, we just mention the current version they're on, and hope that's enough of a nudge.
+    // TODO: determine what version they need to be on
+    // TODO: also mention the platform we're assuming
+    // TODO: determine what platform they need to be on
+    add_inferred_python_version_hint_to_diagnostic(
+        db,
+        &mut diagnostic,
+        &format!("accessing `{}`", attr.id),
+    );
 }

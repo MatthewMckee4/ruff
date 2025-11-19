@@ -5,7 +5,7 @@ use crate::types::tuple::TupleType;
 use crate::types::{
     ApplyTypeMappingVisitor, ClassLiteral, ClassType, DynamicType, KnownClass, KnownInstanceType,
     MaterializationKind, MroError, MroIterator, NormalizedVisitor, SpecialFormType, Type,
-    TypeMapping, todo_type,
+    TypeContext, TypeMapping, todo_type,
 };
 
 /// Enumeration of the possible kinds of types we allow in class bases.
@@ -49,10 +49,7 @@ impl<'db> ClassBase<'db> {
             ClassBase::Dynamic(DynamicType::Any) => "Any",
             ClassBase::Dynamic(DynamicType::Unknown) => "Unknown",
             ClassBase::Dynamic(
-                DynamicType::Todo(_)
-                | DynamicType::TodoPEP695ParamSpec
-                | DynamicType::TodoTypeAlias
-                | DynamicType::TodoUnpack,
+                DynamicType::Todo(_) | DynamicType::TodoTypeAlias | DynamicType::TodoUnpack,
             ) => "@Todo",
             ClassBase::Dynamic(DynamicType::Divergent(_)) => "Divergent",
             ClassBase::Protocol => "Protocol",
@@ -140,6 +137,12 @@ impl<'db> ClassBase<'db> {
 
             Type::TypeAlias(alias) => Self::try_from_type(db, alias.value_type(db), subclass),
 
+            Type::NewTypeInstance(newtype) => ClassBase::try_from_type(
+                db,
+                Type::instance(db, newtype.base_class_type(db)),
+                subclass,
+            ),
+
             Type::PropertyInstance(_)
             | Type::BooleanLiteral(_)
             | Type::FunctionLiteral(_)
@@ -155,7 +158,6 @@ impl<'db> ClassBase<'db> {
             | Type::StringLiteral(_)
             | Type::LiteralString
             | Type::ModuleLiteral(_)
-            | Type::NonInferableTypeVar(_)
             | Type::TypeVar(_)
             | Type::BoundSuper(_)
             | Type::ProtocolInstance(_)
@@ -171,7 +173,27 @@ impl<'db> ClassBase<'db> {
                 | KnownInstanceType::TypeVar(_)
                 | KnownInstanceType::Deprecated(_)
                 | KnownInstanceType::Field(_)
-                | KnownInstanceType::ConstraintSet(_) => None,
+                | KnownInstanceType::ConstraintSet(_)
+                | KnownInstanceType::Callable(_)
+                | KnownInstanceType::UnionType(_)
+                | KnownInstanceType::Literal(_)
+                // A class inheriting from a newtype would make intuitive sense, but newtype
+                // wrappers are just identity callables at runtime, so this sort of inheritance
+                // doesn't work and isn't allowed.
+                | KnownInstanceType::NewType(_) => None,
+                KnownInstanceType::TypeGenericAlias(_) => {
+                    Self::try_from_type(db, KnownClass::Type.to_class_literal(db), subclass)
+                }
+                KnownInstanceType::Annotated(ty) => {
+                    // Unions are not supported in this position, so we only need to support
+                    // something like `class C(Annotated[Base, "metadata"]): ...`, which we
+                    // can do by turning the instance type (`Base` in this example) back into
+                    // a class.
+                    let annotated_ty = ty.inner(db);
+                    let instance_ty = annotated_ty.as_nominal_instance()?;
+
+                    Some(Self::Class(instance_ty.class(db)))
+                }
             },
 
             Type::SpecialForm(special_form) => match special_form {
@@ -277,11 +299,12 @@ impl<'db> ClassBase<'db> {
         self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
+        tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
         match self {
             Self::Class(class) => {
-                Self::Class(class.apply_type_mapping_impl(db, type_mapping, visitor))
+                Self::Class(class.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
             }
             Self::Dynamic(_) | Self::Generic | Self::Protocol | Self::TypedDict => self,
         }
@@ -296,6 +319,7 @@ impl<'db> ClassBase<'db> {
             let new_self = self.apply_type_mapping_impl(
                 db,
                 &TypeMapping::Specialization(specialization),
+                TypeContext::default(),
                 &ApplyTypeMappingVisitor::default(),
             );
             match specialization.materialization_kind(db) {
@@ -311,6 +335,7 @@ impl<'db> ClassBase<'db> {
         self.apply_type_mapping_impl(
             db,
             &TypeMapping::Materialize(kind),
+            TypeContext::default(),
             &ApplyTypeMappingVisitor::default(),
         )
     }
@@ -345,6 +370,27 @@ impl<'db> ClassBase<'db> {
                 ClassBaseMroIterator::from_class(db, class, additional_specialization)
             }
         }
+    }
+
+    pub(super) fn display(self, db: &'db dyn Db) -> impl std::fmt::Display {
+        struct ClassBaseDisplay<'db> {
+            db: &'db dyn Db,
+            base: ClassBase<'db>,
+        }
+
+        impl std::fmt::Display for ClassBaseDisplay<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.base {
+                    ClassBase::Dynamic(dynamic) => dynamic.fmt(f),
+                    ClassBase::Class(class) => Type::from(class).display(self.db).fmt(f),
+                    ClassBase::Protocol => f.write_str("typing.Protocol"),
+                    ClassBase::Generic => f.write_str("typing.Generic"),
+                    ClassBase::TypedDict => f.write_str("typing.TypedDict"),
+                }
+            }
+        }
+
+        ClassBaseDisplay { db, base: self }
     }
 }
 

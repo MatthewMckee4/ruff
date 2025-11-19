@@ -44,6 +44,7 @@ use crate::types::{
     TypeVarBoundOrConstraints, UnionType,
 };
 use crate::{Db, FxOrderSet};
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +207,7 @@ enum ReduceResult<'db> {
 //
 // For now (until we solve https://github.com/astral-sh/ty/issues/957), keep this number
 // below 200, which is the salsa fixpoint iteration limit.
-const MAX_UNION_LITERALS: usize = 199;
+const MAX_UNION_LITERALS: usize = 190;
 
 pub struct UnionBuilder<'db> {
     elements: Vec<UnionElement<'db>>,
@@ -246,6 +247,8 @@ impl<'db> UnionBuilder<'db> {
     }
 
     /// Adds a type to this union.
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn add(mut self, ty: Type<'db>) -> Self {
         self.add_in_place(ty);
         self
@@ -421,10 +424,10 @@ impl<'db> UnionBuilder<'db> {
                     .elements
                     .iter()
                     .filter_map(UnionElement::to_type_element)
-                    .filter_map(Type::into_enum_literal)
-                    .map(|literal| literal.name(self.db).clone())
-                    .chain(std::iter::once(enum_member_to_add.name(self.db).clone()))
-                    .collect::<FxOrderSet<_>>();
+                    .filter_map(Type::as_enum_literal)
+                    .map(|literal| literal.name(self.db))
+                    .chain(std::iter::once(enum_member_to_add.name(self.db)))
+                    .collect::<FxHashSet<_>>();
 
                 let all_members_are_in_union = metadata
                     .members
@@ -502,18 +505,9 @@ impl<'db> UnionBuilder<'db> {
             }
 
             if should_simplify_full && !matches!(element_type, Type::TypeAlias(_)) {
-                if ty.is_equivalent_to(self.db, element_type)
-                    || ty.is_subtype_of(self.db, element_type)
-                    || ty.into_intersection().is_some_and(|intersection| {
-                        intersection.positive(self.db).contains(&element_type)
-                    })
-                {
+                if ty.is_redundant_with(self.db, element_type) {
                     return;
-                } else if element_type.is_subtype_of(self.db, ty)
-                    || element_type
-                        .into_intersection()
-                        .is_some_and(|intersection| intersection.positive(self.db).contains(&ty))
-                {
+                } else if element_type.is_redundant_with(self.db, ty) {
                     to_remove.push(index);
                 } else if ty_negated.is_subtype_of(self.db, element_type) {
                     // We add `ty` to the union. We just checked that `~ty` is a subtype of an
@@ -659,7 +653,7 @@ impl<'db> IntersectionBuilder<'db> {
                 for intersection in &self.intersections {
                     if intersection.negative.iter().any(|negative| {
                         negative
-                            .into_enum_literal()
+                            .as_enum_literal()
                             .is_some_and(|lit| lit.enum_class_instance(self.db) == ty)
                     }) {
                         contains_enum_literal_as_negative_element = true;
@@ -863,7 +857,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
 
             _ => {
                 let known_instance = new_positive
-                    .into_nominal_instance()
+                    .as_nominal_instance()
                     .and_then(|instance| instance.known_class(db));
 
                 if known_instance == Some(KnownClass::Object) {
@@ -930,13 +924,11 @@ impl<'db> InnerIntersectionBuilder<'db> {
                 let mut to_remove = SmallVec::<[usize; 1]>::new();
                 for (index, existing_positive) in self.positive.iter().enumerate() {
                     // S & T = S    if S <: T
-                    if existing_positive.is_subtype_of(db, new_positive)
-                        || existing_positive.is_equivalent_to(db, new_positive)
-                    {
+                    if existing_positive.is_redundant_with(db, new_positive) {
                         return;
                     }
                     // same rule, reverse order
-                    if new_positive.is_subtype_of(db, *existing_positive) {
+                    if new_positive.is_redundant_with(db, *existing_positive) {
                         to_remove.push(index);
                     }
                     // A & B = Never    if A and B are disjoint
@@ -977,7 +969,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
         let contains_bool = || {
             self.positive
                 .iter()
-                .filter_map(|ty| ty.into_nominal_instance())
+                .filter_map(|ty| ty.as_nominal_instance())
                 .filter_map(|instance| instance.known_class(db))
                 .any(KnownClass::is_bool)
         };
@@ -1027,9 +1019,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                 let mut to_remove = SmallVec::<[usize; 1]>::new();
                 for (index, existing_negative) in self.negative.iter().enumerate() {
                     // ~S & ~T = ~T    if S <: T
-                    if existing_negative.is_subtype_of(db, new_negative)
-                        || existing_negative.is_equivalent_to(db, new_negative)
-                    {
+                    if existing_negative.is_redundant_with(db, new_negative) {
                         to_remove.push(index);
                     }
                     // same rule, reverse order
@@ -1075,8 +1065,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
         let mut positive_to_remove = SmallVec::<[usize; 1]>::new();
 
         for (typevar_index, ty) in self.positive.iter().enumerate() {
-            let (Type::NonInferableTypeVar(bound_typevar) | Type::TypeVar(bound_typevar)) = ty
-            else {
+            let Type::TypeVar(bound_typevar) = ty else {
                 continue;
             };
             let Some(TypeVarBoundOrConstraints::Constraints(constraints)) =
@@ -1090,7 +1079,11 @@ impl<'db> InnerIntersectionBuilder<'db> {
             // don't need to worry about finding any particular constraint more than once.
             let constraints = constraints.elements(db);
             let mut positive_constraint_count = 0;
-            for positive in &self.positive {
+            for (i, positive) in self.positive.iter().enumerate() {
+                if i == typevar_index {
+                    continue;
+                }
+
                 // This linear search should be fine as long as we don't encounter typevars with
                 // thousands of constraints.
                 positive_constraint_count += constraints
@@ -1155,6 +1148,39 @@ impl<'db> InnerIntersectionBuilder<'db> {
 
     fn build(mut self, db: &'db dyn Db) -> Type<'db> {
         self.simplify_constrained_typevars(db);
+
+        // If any typevars are in `self.positive`, speculatively solve all bounded type variables
+        // to their upper bound and all constrained type variables to the union of their constraints.
+        // If that speculative intersection simplifies to `Never`, this intersection must also simplify
+        // to `Never`.
+        if self.positive.iter().any(|ty| ty.is_type_var()) {
+            let mut speculative = IntersectionBuilder::new(db);
+            for pos in &self.positive {
+                match pos {
+                    Type::TypeVar(type_var) => {
+                        match type_var.typevar(db).bound_or_constraints(db) {
+                            Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
+                                speculative = speculative.add_positive(bound);
+                            }
+                            Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
+                                speculative = speculative.add_positive(Type::Union(constraints));
+                            }
+                            // TypeVars without a bound or constraint implicitly have `object` as their
+                            // upper bound, and it is always a no-op to add `object` to an intersection.
+                            None => {}
+                        }
+                    }
+                    _ => speculative = speculative.add_positive(*pos),
+                }
+            }
+            for neg in &self.negative {
+                speculative = speculative.add_negative(*neg);
+            }
+            if speculative.build().is_never() {
+                return Type::Never;
+            }
+        }
+
         match (self.positive.len(), self.negative.len()) {
             (0, 0) => Type::object(),
             (1, 0) => self.positive[0],
@@ -1264,7 +1290,7 @@ mod tests {
 
         let safe_uuid_class = known_module_symbol(&db, KnownModule::Uuid, "SafeUUID")
             .place
-            .ignore_possibly_unbound()
+            .ignore_possibly_undefined()
             .unwrap();
 
         let literals = enum_member_literals(&db, safe_uuid_class.expect_class_literal(), None)
