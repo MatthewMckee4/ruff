@@ -8685,7 +8685,7 @@ impl get_size2::GetSize for TypeVarIdentity<'_> {}
 #[derive(PartialOrd, Ord)]
 pub struct TypeVarInstance<'db> {
     /// The identity of this typevar
-    pub identity: TypeVarIdentity<'db>,
+    pub(crate) identity: TypeVarIdentity<'db>,
 
     /// The upper bound or constraint on the type of this TypeVar, if any. Don't use this field
     /// directly; use the `bound_or_constraints` (or `upper_bound` and `constraints`) methods
@@ -8759,7 +8759,7 @@ impl<'db> TypeVarInstance<'db> {
         matches!(self.kind(db), TypeVarKind::TypingSelf)
     }
 
-    pub(crate) fn upper_bound(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    pub fn upper_bound(self, db: &'db dyn Db) -> Option<Type<'db>> {
         if let Some(TypeVarBoundOrConstraints::UpperBound(ty)) = self.bound_or_constraints(db) {
             Some(ty)
         } else {
