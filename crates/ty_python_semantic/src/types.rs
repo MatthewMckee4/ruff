@@ -851,7 +851,7 @@ impl<'db> Type<'db> {
         matches!(self, Type::Callable(..))
     }
 
-    fn is_none(&self, db: &'db dyn Db) -> bool {
+    pub fn is_none(&self, db: &'db dyn Db) -> bool {
         self.is_instance_of(db, KnownClass::NoneType)
     }
 
