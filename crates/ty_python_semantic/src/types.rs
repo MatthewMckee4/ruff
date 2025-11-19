@@ -25,10 +25,10 @@ pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::{PairVisitor, TypeTransformer};
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{TypeCheckDiagnostics, UNDEFINED_REVEAL};
+pub use self::infer::TypeContext;
 pub(crate) use self::infer::{
-    TypeContext, infer_deferred_types, infer_definition_types, infer_expression_type,
-    infer_expression_types, infer_isolated_expression, infer_scope_types,
-    static_expression_truthiness,
+    infer_deferred_types, infer_definition_types, infer_expression_type, infer_expression_types,
+    infer_isolated_expression, infer_scope_types, static_expression_truthiness,
 };
 pub(crate) use self::signatures::{CallableSignature, Parameter, Parameters, Signature};
 pub(crate) use self::subclass_of::{SubclassOfInner, SubclassOfType};
