@@ -76,9 +76,9 @@ use crate::types::diagnostic::{
     report_invalid_generator_function_return_type, report_invalid_key_on_typed_dict,
     report_invalid_or_unsupported_base, report_invalid_return_type,
     report_invalid_type_checking_constant,
-    report_namedtuple_field_without_default_after_field_with_default, report_non_subscriptable,
-    report_possibly_missing_attribute, report_possibly_unresolved_reference,
-    report_rebound_typevar, report_slice_step_size_zero,
+    report_namedtuple_field_without_default_after_field_with_default, report_non_exhaustive_match,
+    report_non_subscriptable, report_possibly_missing_attribute,
+    report_possibly_unresolved_reference, report_rebound_typevar, report_slice_step_size_zero,
 };
 use crate::types::function::{
     FunctionDecorators, FunctionLiteral, FunctionType, KnownFunction, OverloadLiteral,
@@ -3385,7 +3385,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             cases,
         } = match_statement;
 
-        self.infer_standalone_expression(subject, TypeContext::default());
+        let subject_ty = self.infer_standalone_expression(subject, TypeContext::default());
+
+        let mut pattern_types = Vec::new();
+
+        let mut has_wildcard = false;
 
         for case in cases {
             let ast::MatchCase {
@@ -3400,12 +3404,35 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             if let Some(guard) = guard.as_deref() {
                 let guard_ty = self.infer_standalone_expression(guard, TypeContext::default());
 
+                pattern_types.push(guard_ty);
+
                 if let Err(err) = guard_ty.try_bool(self.db()) {
                     err.report_diagnostic(&self.context, guard);
                 }
+            } else {
+                has_wildcard = true;
             }
 
             self.infer_body(body);
+        }
+
+        dbg!(&pattern_types);
+        dbg!(has_wildcard);
+
+        if !has_wildcard {
+            let mut union = UnionBuilder::new(self.db());
+
+            for pattern_type in pattern_types {
+                union = union.add(pattern_type);
+            }
+
+            let union_ty = union.build();
+
+            dbg!(&union_ty);
+
+            if !subject_ty.is_assignable_to(self.db(), union_ty) {
+                report_non_exhaustive_match(&self.context, subject);
+            }
         }
     }
 

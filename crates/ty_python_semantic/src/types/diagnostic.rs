@@ -117,6 +117,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&MISSING_TYPED_DICT_KEY);
     registry.register_lint(&INVALID_METHOD_OVERRIDE);
     registry.register_lint(&INVALID_EXPLICIT_OVERRIDE);
+    registry.register_lint(&NON_EXHAUSTIVE_MATCH);
 
     // String annotations
     registry.register_lint(&BYTE_STRING_TYPE_ANNOTATION);
@@ -2057,6 +2058,34 @@ declare_lint! {
     }
 }
 
+declare_lint! {
+    /// ## What it does
+    /// Detects non-exhaustive patterns in match statements.
+    ///
+    /// ## Why is this bad?
+    /// This can cause unexpected behavior.
+    ///
+    /// ## Example
+    /// ```python
+    /// from enum import Enum
+    ///
+    /// class Color(Enum):
+    ///     RED = 1
+    ///     GREEN = 2
+    ///     BLUE = 3
+    ///
+    /// def foo(color: Color):
+    ///     match color:
+    ///         case Color.RED:
+    ///             print("red")
+    /// ```
+    pub(crate) static NON_EXHAUSTIVE_MATCH = {
+        summary: "detects non-exhaustive patterns in match statements",
+        status: LintStatus::stable("0.0.1-alpha.20"),
+        default_level: Level::Warn,
+    }
+}
+
 /// A collection of type check diagnostics.
 #[derive(Default, Eq, PartialEq, get_size2::GetSize)]
 pub struct TypeCheckDiagnostics {
@@ -3676,6 +3705,14 @@ pub(super) fn report_invalid_method_override<'db>(
             diagnostic.help(subdiag);
         }
     }
+}
+
+pub(super) fn report_non_exhaustive_match(context: &InferContext, match_subject: &ast::Expr) {
+    let Some(builder) = context.report_lint(&NON_EXHAUSTIVE_MATCH, match_subject.range()) else {
+        return;
+    };
+
+    builder.into_diagnostic("TODO");
 }
 
 /// This function receives an unresolved `from foo import bar` import,

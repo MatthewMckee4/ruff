@@ -60,6 +60,7 @@ x = get_object()
 
 reveal_type(x)  # revealed: object
 
+# error: [non-exhaustive-match]
 match x:
     case A() if reveal_type(x):  # revealed: A
         pass
@@ -292,6 +293,7 @@ x = get_object()
 
 reveal_type(x)  # revealed: object
 
+# error: [non-exhaustive-match]
 match x:
     case str() | float() if type(x) is str:
         reveal_type(x)  #  revealed: str
@@ -315,6 +317,7 @@ x = get_object()
 
 reveal_type(x)  # revealed: object
 
+# error: [non-exhaustive-match]
 match x:
     case str() | float() if type(x) is str and reveal_type(x):  # revealed: str
         pass
@@ -374,4 +377,30 @@ try:
     reveal_type(Answer.MAYBE.assert_yes())  # revealed: Literal[Answer.MAYBE]
 except ValueError:
     pass
+```
+
+## Non-exhaustive match
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 0
+    GREEN = 1
+    BLUE = 2
+
+def foo(color: Color):
+    # error: [non-exhaustive-match]
+    match color:
+        case Color.RED:
+            print("red")
+
+def bar(color: Color):
+    match color:
+        case Color.RED:
+            print("red")
+        case Color.GREEN:
+            print("green")
+        case _ if color == Color.BLUE:
+            print("blue")
 ```
