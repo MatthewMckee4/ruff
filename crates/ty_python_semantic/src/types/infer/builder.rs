@@ -1470,7 +1470,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Type::BooleanLiteral(_) | Type::IntLiteral(_) => true,
             Type::NominalInstance(instance) => match instance.known_class(self.db()) {
                 Some(KnownClass::Int | KnownClass::Bool) => true,
-                Some(KnownClass::Float) => false,
+                Some(KnownClass::Float | KnownClass::Complex) => false,
                 _ => return false,
             },
             _ => return false,
