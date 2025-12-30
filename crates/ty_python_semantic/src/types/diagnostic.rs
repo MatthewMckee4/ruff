@@ -59,6 +59,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&CYCLIC_TYPE_ALIAS_DEFINITION);
     registry.register_lint(&DEPRECATED);
     registry.register_lint(&DIVISION_BY_ZERO);
+    registry.register_lint(&NEGATIVE_SHIFT);
     registry.register_lint(&DUPLICATE_BASE);
     registry.register_lint(&DUPLICATE_KW_ONLY);
     registry.register_lint(&INSTANCE_LAYOUT_CONFLICT);
@@ -346,6 +347,29 @@ declare_lint! {
     pub(crate) static DIVISION_BY_ZERO = {
         summary: "detects division by zero",
         status: LintStatus::preview("0.0.1-alpha.1"),
+        default_level: Level::Ignore,
+    }
+}
+
+declare_lint! {
+    /// ## What it does
+    /// Detects shifting an integer by a negative integer.
+    ///
+    /// ## Why is this bad?
+    /// Bit shifting by a negative value raises a `ValueError` at runtime.
+    ///
+    /// ## Rule status
+    /// This rule is currently disabled by default because of the number of
+    /// false positives it can produce.
+    ///
+    /// ## Examples
+    /// ```python
+    /// 1 << -1
+    /// 1 >> -1
+    /// ```
+    pub(crate) static NEGATIVE_SHIFT = {
+        summary: "detects shifting an integer by a negative integer",
+        status: LintStatus::preview("0.0.8"),
         default_level: Level::Ignore,
     }
 }

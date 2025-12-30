@@ -57,6 +57,18 @@ reveal_type(a ^ a)  # revealed: Literal[False]
 reveal_type(a ^ b)  # revealed: Literal[True]
 reveal_type(b ^ a)  # revealed: Literal[True]
 reveal_type(b ^ b)  # revealed: Literal[False]
+
+# left shift
+reveal_type(a << a)  # revealed: Literal[2]
+reveal_type(a << b)  # revealed: Literal[1]
+reveal_type(b << a)  # revealed: Literal[0]
+reveal_type(b << b)  # revealed: Literal[0]
+
+# right shift
+reveal_type(a >> a)  # revealed: Literal[0]
+reveal_type(a >> b)  # revealed: Literal[1]
+reveal_type(b >> a)  # revealed: Literal[0]
+reveal_type(b >> b)  # revealed: Literal[0]
 ```
 
 ## Arithmetic with a variable

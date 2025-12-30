@@ -98,6 +98,52 @@ reveal_type(10 // -6)  # revealed: Literal[-2]
 reveal_type(-10 // -6)  # revealed: Literal[1]
 ```
 
+## Shift Operations
+
+Left shift (`<<`) and right shift (`>>`) operations on literal integers produce literal results:
+
+```py
+reveal_type(1 << 0)  # revealed: Literal[1]
+reveal_type(1 << 1)  # revealed: Literal[2]
+reveal_type(1 << 2)  # revealed: Literal[4]
+reveal_type(2 << 2)  # revealed: Literal[8]
+reveal_type(5 << 3)  # revealed: Literal[40]
+
+reveal_type(8 >> 0)  # revealed: Literal[8]
+reveal_type(8 >> 1)  # revealed: Literal[4]
+reveal_type(8 >> 2)  # revealed: Literal[2]
+reveal_type(8 >> 3)  # revealed: Literal[1]
+reveal_type(8 >> 4)  # revealed: Literal[0]
+
+# Negative numbers
+reveal_type(-1 << 2)  # revealed: Literal[-4]
+reveal_type(-8 >> 1)  # revealed: Literal[-4]
+reveal_type(-8 >> 2)  # revealed: Literal[-2]
+reveal_type(-8 >> 3)  # revealed: Literal[-1]
+reveal_type(-8 >> 4)  # revealed: Literal[-1]
+reveal_type(-1 >> 100)  # revealed: Literal[-1]
+
+def lhs(x: int):
+    reveal_type(x << 1)  # revealed: int
+    reveal_type(x >> 1)  # revealed: int
+
+def rhs(x: int):
+    reveal_type(1 << x)  # revealed: int
+    reveal_type(8 >> x)  # revealed: int
+
+def both(x: int):
+    reveal_type(x << x)  # revealed: int
+    reveal_type(x >> x)  # revealed: int
+```
+
+Large shifts that would overflow the literal representation fall back to `int`:
+
+```py
+reveal_type(1 << 62)  # revealed: Literal[4611686018427387904]
+reveal_type(1 << 63)  # revealed: int
+reveal_type(1 << 100)  # revealed: int
+```
+
 ## Division by Zero
 
 This error is really outside the current Python type system, because e.g. `int.__truediv__` and
@@ -138,4 +184,32 @@ class MyInt(int): ...
 
 # No error for a subclass of int
 reveal_type(MyInt(3) / 0)  # revealed: int | float
+```
+
+## Negative Shift
+
+Similar to division by zero, shifting by a negative amount raises `ValueError` at runtime.
+
+```py
+a = 1 << -1  # error: "Cannot left shift object of type `Literal[1]` by a negative value"
+reveal_type(a)  # revealed: int
+
+b = 8 >> -1  # error: "Cannot right shift object of type `Literal[8]` by a negative value"
+reveal_type(b)  # revealed: int
+
+# error: "Cannot left shift object of type `int` by a negative value"
+reveal_type(int() << -1)  # revealed: int
+
+# error: "Cannot left shift object of type `Literal[1]` by a negative value"
+reveal_type(1 << (-1))  # revealed: int
+
+# error: [negative-shift] "Cannot left shift object of type `Literal[True]` by a negative value"
+True << -1
+# error: [negative-shift] "Cannot right shift object of type `Literal[True]` by a negative value"
+True >> (-1)
+
+class MyInt(int): ...
+
+# No error for a subclass of int
+reveal_type(MyInt(3) << -1)  # revealed: int
 ```
