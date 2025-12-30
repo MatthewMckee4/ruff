@@ -1476,7 +1476,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => return false,
         };
 
-        let (op_str, reason, lint) = match (op, lhs_is_int_like) {
+        let (op, reason, lint) = match (op, lhs_is_int_like) {
             (ast::Operator::Div, _) => ("divide", "by zero", &DIVISION_BY_ZERO),
             (ast::Operator::FloorDiv, _) => ("floor divide", "by zero", &DIVISION_BY_ZERO),
             (ast::Operator::Mod, _) => ("reduce", "modulo zero", &DIVISION_BY_ZERO),
@@ -1489,7 +1489,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if let Some(builder) = self.context.report_lint(lint, node) {
             builder.into_diagnostic(format_args!(
-                "Cannot {op_str} object of type `{}` {reason}",
+                "Cannot {op} object of type `{}` {reason}",
                 left.display(self.db())
             ));
         }
@@ -10157,7 +10157,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         right_ty: Type<'db>,
         op: ast::Operator,
     ) -> Option<Type<'db>> {
-        // Check for division by zero or shift by a negative value; this doesn't change the
+        // Check for a bad operation; this doesn't change the
         // inferred type for the expression, but may emit a diagnostic
         if !emitted_bad_literal_math_diagnostic {
             emitted_bad_literal_math_diagnostic = match (op, right_ty) {

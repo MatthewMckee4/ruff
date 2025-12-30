@@ -876,6 +876,16 @@
             }
           ]
         },
+        "negative-shift": {
+          "title": "detects shifting an integer by a negative integer",
+          "description": "## What it does\nDetects shifting an integer by a negative integer.\n\n## Why is this bad?\nBit shifting by a negative value raises a `ValueError` at runtime.\n\n## Rule status\nThis rule is currently disabled by default because of the number of\nfalse positives it can produce.\n\n## Examples\n```python\n1 << -1\n1 >> -1\n```",
+          "default": "ignore",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Level"
+            }
+          ]
+        },
         "no-matching-overload": {
           "title": "detects calls that do not match any overload",
           "description": "## What it does\nChecks for calls to an overloaded function that do not match any of the overloads.\n\n## Why is this bad?\nFailing to provide the correct arguments to one of the overloads will raise a `TypeError`\nat runtime.\n\n## Examples\n```python\n@overload\ndef func(x: int): ...\n@overload\ndef func(x: bool): ...\nfunc(\"string\")  # error: [no-matching-overload]\n```",
