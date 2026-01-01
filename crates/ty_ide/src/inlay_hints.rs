@@ -7,6 +7,7 @@ use ruff_python_ast::visitor::source_order::{self, SourceOrderVisitor, Traversal
 use ruff_python_ast::{AnyNodeRef, ArgOrKeyword, Expr, ExprUnaryOp, Stmt, UnaryOp};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_semantic::types::ide_support::inlay_hint_call_argument_details;
+use ty_python_semantic::types::list_members::all_members;
 use ty_python_semantic::types::{Type, TypeDetail};
 use ty_python_semantic::{HasType, SemanticModel};
 
@@ -372,8 +373,16 @@ impl<'a> SourceOrderVisitor<'a> for InlayHintVisitor<'a, '_> {
             Expr::Attribute(attribute) => {
                 if let Some(rhs) = self.assignment_rhs {
                     if attribute.ctx.is_store() {
-                        if let Some(ty) = expr.inferred_type(&self.model) {
-                            self.add_type_hint(expr, rhs, ty, !self.in_no_edits_allowed);
+                        let value_ty = attribute.value.inferred_type(&self.model);
+
+                        if let Some(value_ty) = value_ty {
+                            let member = all_members(self.db, value_ty)
+                                .into_iter()
+                                .find(|member| member.name == attribute.attr.as_str());
+
+                            if let Some(member) = member {
+                                self.add_type_hint(expr, rhs, member.ty, !self.in_no_edits_allowed);
+                            }
                         }
                     }
                 }
@@ -1864,16 +1873,54 @@ mod tests {
             ",
         );
 
-        assert_snapshot!(test.inlay_hints(), @r"
+        assert_snapshot!(test.inlay_hints(), @r#"
         class A:
             def __init__(self, y):
-                self.x = int(1)
+                self.x[: Unknown | int] = int(1)
                 self.y[: Unknown] = y
 
         a = A([y=]2)
-        a.y = int(3)
+        a.y[: Unknown] = int(3)
 
         ---------------------------------------------
+        info[inlay-hint-location]: Inlay Hint Target
+          --> stdlib/ty_extensions.pyi:14:1
+           |
+        13 | # Types
+        14 | Unknown = object()
+           | ^^^^^^^
+        15 | AlwaysTruthy = object()
+        16 | AlwaysFalsy = object()
+           |
+        info: Source
+         --> main2.py:4:18
+          |
+        2 | class A:
+        3 |     def __init__(self, y):
+        4 |         self.x[: Unknown | int] = int(1)
+          |                  ^^^^^^^
+        5 |         self.y[: Unknown] = y
+          |
+
+        info[inlay-hint-location]: Inlay Hint Target
+           --> stdlib/builtins.pyi:348:7
+            |
+        347 | @disjoint_base
+        348 | class int:
+            |       ^^^
+        349 |     """int([x]) -> integer
+        350 |     int(x, base=10) -> integer
+            |
+        info: Source
+         --> main2.py:4:28
+          |
+        2 | class A:
+        3 |     def __init__(self, y):
+        4 |         self.x[: Unknown | int] = int(1)
+          |                            ^^^
+        5 |         self.y[: Unknown] = y
+          |
+
         info[inlay-hint-location]: Inlay Hint Target
           --> stdlib/ty_extensions.pyi:14:1
            |
@@ -1887,7 +1934,7 @@ mod tests {
          --> main2.py:5:18
           |
         3 |     def __init__(self, y):
-        4 |         self.x = int(1)
+        4 |         self.x[: Unknown | int] = int(1)
         5 |         self.y[: Unknown] = y
           |                  ^^^^^^^
         6 |
@@ -1910,7 +1957,24 @@ mod tests {
         6 |
         7 | a = A([y=]2)
           |        ^
-        8 | a.y = int(3)
+        8 | a.y[: Unknown] = int(3)
+          |
+
+        info[inlay-hint-location]: Inlay Hint Target
+          --> stdlib/ty_extensions.pyi:14:1
+           |
+        13 | # Types
+        14 | Unknown = object()
+           | ^^^^^^^
+        15 | AlwaysTruthy = object()
+        16 | AlwaysFalsy = object()
+           |
+        info: Source
+         --> main2.py:8:7
+          |
+        7 | a = A([y=]2)
+        8 | a.y[: Unknown] = int(3)
+          |       ^^^^^^^
           |
 
         ---------------------------------------------
@@ -1919,12 +1983,12 @@ mod tests {
 
         class A:
             def __init__(self, y):
-                self.x = int(1)
+                self.x: Unknown | int = int(1)
                 self.y: Unknown = y
 
         a = A(2)
-        a.y = int(3)
-        ");
+        a.y: Unknown = int(3)
+        "#);
     }
 
     #[test]
@@ -3101,8 +3165,8 @@ mod tests {
         assert_snapshot!(test.inlay_hints(), @r#"
         class MyClass[T, U]:
             def __init__(self, x: list[T], y: tuple[U, U]):
-                self.x[: list[T@MyClass]] = x
-                self.y[: tuple[U@MyClass, U@MyClass]] = y
+                self.x[: Unknown | list[T@MyClass]] = x
+                self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
 
         x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
         y[: tuple[MyClass[Unknown | int, str], MyClass[Unknown | int, str]]] = (MyClass([x=][42], [y=]("a", "b")), MyClass([x=][42], [y=]("a", "b")))
@@ -3110,6 +3174,25 @@ mod tests {
         c[: MyClass[Unknown | int, str]], d[: MyClass[Unknown | int, str]] = (MyClass([x=][42], [y=]("a", "b")), MyClass([x=][42], [y=]("a", "b")))
 
         ---------------------------------------------
+        info[inlay-hint-location]: Inlay Hint Target
+          --> stdlib/ty_extensions.pyi:14:1
+           |
+        13 | # Types
+        14 | Unknown = object()
+           | ^^^^^^^
+        15 | AlwaysTruthy = object()
+        16 | AlwaysFalsy = object()
+           |
+        info: Source
+         --> main2.py:4:18
+          |
+        2 | class MyClass[T, U]:
+        3 |     def __init__(self, x: list[T], y: tuple[U, U]):
+        4 |         self.x[: Unknown | list[T@MyClass]] = x
+          |                  ^^^^^^^
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
+          |
+
         info[inlay-hint-location]: Inlay Hint Target
             --> stdlib/builtins.pyi:2829:7
              |
@@ -3119,13 +3202,33 @@ mod tests {
         2830 |     """Built-in mutable sequence.
              |
         info: Source
-         --> main2.py:4:18
+         --> main2.py:4:28
           |
         2 | class MyClass[T, U]:
         3 |     def __init__(self, x: list[T], y: tuple[U, U]):
-        4 |         self.x[: list[T@MyClass]] = x
-          |                  ^^^^
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        4 |         self.x[: Unknown | list[T@MyClass]] = x
+          |                            ^^^^
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
+          |
+
+        info[inlay-hint-location]: Inlay Hint Target
+          --> stdlib/ty_extensions.pyi:14:1
+           |
+        13 | # Types
+        14 | Unknown = object()
+           | ^^^^^^^
+        15 | AlwaysTruthy = object()
+        16 | AlwaysFalsy = object()
+           |
+        info: Source
+         --> main2.py:5:18
+          |
+        3 |     def __init__(self, x: list[T], y: tuple[U, U]):
+        4 |         self.x[: Unknown | list[T@MyClass]] = x
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
+          |                  ^^^^^^^
+        6 |
+        7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |
 
         info[inlay-hint-location]: Inlay Hint Target
@@ -3137,12 +3240,12 @@ mod tests {
         2723 |     """Built-in immutable sequence.
              |
         info: Source
-         --> main2.py:5:18
+         --> main2.py:5:28
           |
         3 |     def __init__(self, x: list[T], y: tuple[U, U]):
-        4 |         self.x[: list[T@MyClass]] = x
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
-          |                  ^^^^^
+        4 |         self.x[: Unknown | list[T@MyClass]] = x
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
+          |                            ^^^^^
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |
@@ -3158,7 +3261,7 @@ mod tests {
         info: Source
          --> main2.py:7:5
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |     ^^^^^^^
@@ -3178,7 +3281,7 @@ mod tests {
         info: Source
          --> main2.py:7:13
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |             ^^^^^^^
@@ -3198,7 +3301,7 @@ mod tests {
         info: Source
          --> main2.py:7:23
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |                       ^^^
@@ -3218,7 +3321,7 @@ mod tests {
         info: Source
          --> main2.py:7:28
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |                            ^^^
@@ -3238,7 +3341,7 @@ mod tests {
         info: Source
          --> main2.py:7:45
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |                                             ^
@@ -3258,7 +3361,7 @@ mod tests {
         info: Source
          --> main2.py:7:55
           |
-        5 |         self.y[: tuple[U@MyClass, U@MyClass]] = y
+        5 |         self.y[: Unknown | tuple[U@MyClass, U@MyClass]] = y
         6 |
         7 | x[: MyClass[Unknown | int, str]] = MyClass([x=][42], [y=]("a", "b"))
           |                                                       ^
