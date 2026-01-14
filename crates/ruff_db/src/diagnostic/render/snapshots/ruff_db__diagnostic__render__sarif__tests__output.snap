@@ -1,0 +1,125 @@
+---
+source: crates/ruff_db/src/diagnostic/render/sarif.rs
+expression: env.render_diagnostics(&diagnostics)
+---
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "ty",
+          "informationUri": "https://github.com/astral-sh/ty",
+          "version": "0.0.0",
+          "rules": [
+            {
+              "id": "F401",
+              "shortDescription": {
+                "text": "`os` imported but unused"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/unused-import",
+              "properties": {
+                "id": "F401",
+                "name": "unused-import",
+                "problem.severity": "error"
+              }
+            },
+            {
+              "id": "F821",
+              "shortDescription": {
+                "text": "Undefined name `a`"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/undefined-name",
+              "properties": {
+                "id": "F821",
+                "name": "undefined-name",
+                "problem.severity": "error"
+              }
+            },
+            {
+              "id": "F841",
+              "shortDescription": {
+                "text": "Local variable `x` is assigned to but never used"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/unused-variable",
+              "properties": {
+                "id": "F841",
+                "name": "unused-variable",
+                "problem.severity": "error"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "F401",
+          "level": "error",
+          "message": {
+            "text": "`os` imported but unused"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file://fib.py"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 8,
+                  "endLine": 1,
+                  "endColumn": 10
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "F841",
+          "level": "error",
+          "message": {
+            "text": "Local variable `x` is assigned to but never used"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file://fib.py"
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 5,
+                  "endLine": 6,
+                  "endColumn": 6
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "F821",
+          "level": "error",
+          "message": {
+            "text": "Undefined name `a`"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file://undef.py"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 4,
+                  "endLine": 1,
+                  "endColumn": 5
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

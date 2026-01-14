@@ -366,6 +366,9 @@ pub enum OutputFormat {
     #[value(name = "github")]
     /// Print diagnostics in the format used by GitHub Actions workflow error annotations.
     Github,
+    #[value(name = "sarif")]
+    /// Print diagnostics in the JSON format.
+    Sarif,
 }
 
 impl From<OutputFormat> for ty_project::metadata::options::OutputFormat {
@@ -375,6 +378,7 @@ impl From<OutputFormat> for ty_project::metadata::options::OutputFormat {
             OutputFormat::Concise => Self::Concise,
             OutputFormat::Gitlab => Self::Gitlab,
             OutputFormat::Github => Self::Github,
+            OutputFormat::Sarif => Self::Sarif,
         }
     }
 }

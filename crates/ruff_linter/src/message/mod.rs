@@ -17,14 +17,12 @@ pub use grouped::GroupedEmitter;
 use ruff_notebook::NotebookIndex;
 use ruff_source_file::{SourceFile, SourceFileBuilder};
 use ruff_text_size::{TextRange, TextSize};
-pub use sarif::SarifEmitter;
 
 use crate::Fix;
 use crate::registry::Rule;
 use crate::settings::types::{OutputFormat, RuffOutputFormat};
 
 mod grouped;
-mod sarif;
 
 /// Create a `Diagnostic` from a panic.
 pub fn create_panic_diagnostic(error: &PanicError, path: Option<&Path>) -> Diagnostic {
@@ -217,11 +215,6 @@ pub fn render_diagnostics(
             GroupedEmitter::default()
                 .with_show_fix_status(config.show_fix_status())
                 .with_applicability(config.fix_applicability())
-                .emit(writer, diagnostics, context)
-                .map_err(std::io::Error::other)?;
-        }
-        Err(RuffOutputFormat::Sarif) => {
-            SarifEmitter
                 .emit(writer, diagnostics, context)
                 .map_err(std::io::Error::other)?;
         }

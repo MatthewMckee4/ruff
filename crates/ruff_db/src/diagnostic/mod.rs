@@ -6,6 +6,8 @@ use ruff_source_file::{LineColumn, SourceCode, SourceFile};
 use ruff_annotate_snippets::Level as AnnotateLevel;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+#[cfg(feature = "serde")]
+pub use self::render::sarif::{DisplaySarifDiagnostics, SarifRenderer};
 pub use self::render::{
     DisplayDiagnostic, DisplayDiagnostics, DummyFileResolver, FileResolver, Input,
     ceil_char_boundary,
@@ -1513,11 +1515,15 @@ pub enum DiagnosticFormat {
     /// [Code Quality]: https://docs.gitlab.com/ci/testing/code_quality/#code-quality-report-format
     #[cfg(feature = "serde")]
     Gitlab,
-
     /// Print diagnostics in the format used by [GitHub Actions] workflow error annotations.
     ///
     /// [GitHub Actions]: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-error-message
     Github,
+    /// Print diagnostics in the format used by [SARIF].
+    ///
+    /// [SARIF]: https://sarifweb.azurewebsites.net/
+    #[cfg(feature = "serde")]
+    Sarif,
 }
 
 /// A representation of the kinds of messages inside a diagnostic.

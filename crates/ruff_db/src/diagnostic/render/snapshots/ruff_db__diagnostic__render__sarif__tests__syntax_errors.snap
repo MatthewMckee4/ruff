@@ -1,0 +1,78 @@
+---
+source: crates/ruff_db/src/diagnostic/render/sarif.rs
+expression: env.render_diagnostics(&diagnostics)
+---
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "ty",
+          "informationUri": "https://github.com/astral-sh/ty",
+          "version": "0.0.0",
+          "rules": [
+            {
+              "id": "invalid-syntax",
+              "shortDescription": {
+                "text": "Expected ')', found newline"
+              },
+              "properties": {
+                "id": "invalid-syntax",
+                "name": "invalid-syntax",
+                "problem.severity": "error"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "invalid-syntax",
+          "level": "error",
+          "message": {
+            "text": "Expected one or more symbol names after import"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file://syntax_errors.py"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 15,
+                  "endLine": 2,
+                  "endColumn": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "invalid-syntax",
+          "level": "error",
+          "message": {
+            "text": "Expected ')', found newline"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file://syntax_errors.py"
+                },
+                "region": {
+                  "startLine": 3,
+                  "startColumn": 12,
+                  "endLine": 4,
+                  "endColumn": 1
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

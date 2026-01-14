@@ -1185,6 +1185,10 @@ pub enum OutputFormat {
     ///
     /// [GitHub Actions]: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-error-message
     Github,
+    /// Print diagnostics in the [SARIF] format.
+    ///
+    /// [SARIF]: https://sarifweb.azurewebsites.net/
+    Sarif,
 }
 
 impl OutputFormat {
@@ -1205,6 +1209,7 @@ impl From<OutputFormat> for DiagnosticFormat {
             OutputFormat::Concise => Self::Concise,
             OutputFormat::Gitlab => Self::Gitlab,
             OutputFormat::Github => Self::Github,
+            OutputFormat::Sarif => Self::Sarif,
         }
     }
 }

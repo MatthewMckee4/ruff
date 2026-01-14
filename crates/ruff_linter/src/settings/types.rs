@@ -575,7 +575,6 @@ impl Display for OutputFormat {
 pub enum RuffOutputFormat {
     Github,
     Grouped,
-    Sarif,
 }
 
 impl TryFrom<OutputFormat> for DiagnosticFormat {
@@ -594,7 +593,7 @@ impl TryFrom<OutputFormat> for DiagnosticFormat {
             OutputFormat::Azure => Ok(DiagnosticFormat::Azure),
             OutputFormat::Github => Err(RuffOutputFormat::Github),
             OutputFormat::Grouped => Err(RuffOutputFormat::Grouped),
-            OutputFormat::Sarif => Err(RuffOutputFormat::Sarif),
+            OutputFormat::Sarif => Ok(DiagnosticFormat::Sarif),
         }
     }
 }
