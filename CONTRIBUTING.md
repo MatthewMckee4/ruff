@@ -53,12 +53,12 @@ cargo install cargo-insta
 You'll need [uv](https://docs.astral.sh/uv/getting-started/installation/) (or `pipx` and `pip`) to
 run Python utility commands.
 
-You can optionally install pre-commit hooks to automatically run the validation checks
+You can optionally install hooks to automatically run the validation checks
 when making a commit:
 
 ```shell
-uv tool install pre-commit
-pre-commit install
+uv tool install prek
+prek install
 ```
 
 We recommend [nextest](https://nexte.st/) to run Ruff's test suite (via `cargo nextest run`),
@@ -85,7 +85,7 @@ and that it passes both the lint and test validation checks:
 ```shell
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Rust linting
 RUFF_UPDATE_SCHEMA=1 cargo test  # Rust testing and updating ruff.schema.json
-uvx pre-commit run --all-files --show-diff-on-failure  # Rust and Python formatting, Markdown and Python linting, etc.
+uvx prek run -a  # Rust and Python formatting, Markdown and Python linting, etc.
 ```
 
 These checks will run on GitHub Actions when you open your pull request, but running them locally
@@ -331,13 +331,6 @@ you addressed them.
 
 ## MkDocs
 
-> [!NOTE]
->
-> The documentation uses Material for MkDocs Insiders, which is closed-source software.
-> This means only members of the Astral organization can preview the documentation exactly as it
-> will appear in production.
-> Outside contributors can still preview the documentation, but there will be some differences. Consult [the Material for MkDocs documentation](https://squidfunk.github.io/mkdocs-material/insiders/benefits/#features) for which features are exclusively available in the insiders version.
-
 To preview any changes to the documentation locally:
 
 1. Install the [Rust toolchain](https://www.rust-lang.org/tools/install).
@@ -351,11 +344,7 @@ To preview any changes to the documentation locally:
 1. Run the development server with:
 
     ```shell
-    # For contributors.
-    uvx --with-requirements docs/requirements.txt -- mkdocs serve -f mkdocs.public.yml
-
-    # For members of the Astral org, which has access to MkDocs Insiders via sponsorship.
-    uvx --with-requirements docs/requirements-insiders.txt -- mkdocs serve -f mkdocs.insiders.yml
+    uvx --with-requirements docs/requirements.txt -- mkdocs serve -f mkdocs.yml
     ```
 
 The documentation should then be available locally at
@@ -392,7 +381,7 @@ Commit each step of this process separately for easier review.
 
     - Often labels will be missing from pull requests they will need to be manually organized into the proper section
     - Changes should be edited to be user-facing descriptions, avoiding internal details
-    - Square brackets (eg, `[ruff]` project name) will be automatically escaped by `pre-commit`
+    - Square brackets (eg, `[ruff]` project name) will be automatically escaped by `prek`
 
     Additionally, for minor releases:
 

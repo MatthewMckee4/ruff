@@ -5,7 +5,8 @@ use salsa::plumbing::AsId;
 use crate::{db::Db, types::bound_super::SuperOwnerKind};
 
 use super::{
-    DynamicType, TodoType, Type, TypeIsType, class_base::ClassBase, subclass_of::SubclassOfInner,
+    DynamicType, TodoType, Type, TypeGuardLike, TypeGuardType, TypeIsType, class_base::ClassBase,
+    subclass_of::SubclassOfInner,
 };
 
 /// Return an [`Ordering`] that describes the canonical order in which two types should appear
@@ -117,6 +118,11 @@ pub(super) fn union_or_intersection_elements_ordering<'db>(
                 (SubclassOfInner::Dynamic(left), SubclassOfInner::Dynamic(right)) => {
                     dynamic_elements_ordering(left, right)
                 }
+                (SubclassOfInner::TypeVar(left), SubclassOfInner::TypeVar(right)) => {
+                    left.as_id().cmp(&right.as_id())
+                }
+                (SubclassOfInner::TypeVar(_), _) => Ordering::Less,
+                (_, SubclassOfInner::TypeVar(_)) => Ordering::Greater,
             }
         }
 
@@ -126,6 +132,10 @@ pub(super) fn union_or_intersection_elements_ordering<'db>(
         (Type::TypeIs(left), Type::TypeIs(right)) => typeis_ordering(db, *left, *right),
         (Type::TypeIs(_), _) => Ordering::Less,
         (_, Type::TypeIs(_)) => Ordering::Greater,
+
+        (Type::TypeGuard(left), Type::TypeGuard(right)) => typeguard_ordering(db, *left, *right),
+        (Type::TypeGuard(_), _) => Ordering::Less,
+        (_, Type::TypeGuard(_)) => Ordering::Greater,
 
         (Type::NominalInstance(left), Type::NominalInstance(right)) => {
             left.class(db).cmp(&right.class(db))
@@ -179,6 +189,17 @@ pub(super) fn union_or_intersection_elements_ordering<'db>(
                 }
                 (SuperOwnerKind::Instance(_), _) => Ordering::Less,
                 (_, SuperOwnerKind::Instance(_)) => Ordering::Greater,
+                (
+                    SuperOwnerKind::InstanceTypeVar(left, _),
+                    SuperOwnerKind::InstanceTypeVar(right, _),
+                ) => left.cmp(&right),
+                (SuperOwnerKind::InstanceTypeVar(..), _) => Ordering::Less,
+                (_, SuperOwnerKind::InstanceTypeVar(..)) => Ordering::Greater,
+                (SuperOwnerKind::ClassTypeVar(left, _), SuperOwnerKind::ClassTypeVar(right, _)) => {
+                    left.cmp(&right)
+                }
+                (SuperOwnerKind::ClassTypeVar(..), _) => Ordering::Less,
+                (_, SuperOwnerKind::ClassTypeVar(..)) => Ordering::Greater,
                 (SuperOwnerKind::Dynamic(left), SuperOwnerKind::Dynamic(right)) => {
                     dynamic_elements_ordering(left, right)
                 }
@@ -207,9 +228,7 @@ pub(super) fn union_or_intersection_elements_ordering<'db>(
         (Type::TypeAlias(_), _) => Ordering::Less,
         (_, Type::TypeAlias(_)) => Ordering::Greater,
 
-        (Type::TypedDict(left), Type::TypedDict(right)) => {
-            left.defining_class().cmp(&right.defining_class())
-        }
+        (Type::TypedDict(left), Type::TypedDict(right)) => left.cmp(right),
         (Type::TypedDict(_), _) => Ordering::Less,
         (_, Type::TypedDict(_)) => Ordering::Greater,
 
@@ -260,6 +279,9 @@ fn dynamic_elements_ordering(left: DynamicType, right: DynamicType) -> Ordering 
         (DynamicType::Unknown, _) => Ordering::Less,
         (_, DynamicType::Unknown) => Ordering::Greater,
 
+        (DynamicType::UnknownGeneric(_), _) => Ordering::Less,
+        (_, DynamicType::UnknownGeneric(_)) => Ordering::Greater,
+
         #[cfg(debug_assertions)]
         (DynamicType::Todo(TodoType(left)), DynamicType::Todo(TodoType(right))) => left.cmp(right),
 
@@ -269,24 +291,22 @@ fn dynamic_elements_ordering(left: DynamicType, right: DynamicType) -> Ordering 
         (DynamicType::TodoUnpack, _) => Ordering::Less,
         (_, DynamicType::TodoUnpack) => Ordering::Greater,
 
-        (DynamicType::TodoTypeAlias, _) => Ordering::Less,
-        (_, DynamicType::TodoTypeAlias) => Ordering::Greater,
+        (DynamicType::TodoStarredExpression, _) => Ordering::Less,
+        (_, DynamicType::TodoStarredExpression) => Ordering::Greater,
 
-        (DynamicType::Divergent(left), DynamicType::Divergent(right)) => {
-            left.scope.cmp(&right.scope)
-        }
+        (DynamicType::Divergent(left), DynamicType::Divergent(right)) => left.cmp(&right),
         (DynamicType::Divergent(_), _) => Ordering::Less,
         (_, DynamicType::Divergent(_)) => Ordering::Greater,
     }
 }
 
-/// Determine a canonical order for two instances of [`TypeIsType`].
+/// Generic helper for ordering type guard-like types.
 ///
 /// The following criteria are considered, in order:
 /// * Boundness: Unbound precedes bound
 /// * Symbol name: String comparison
 /// * Guarded type: [`union_or_intersection_elements_ordering`]
-fn typeis_ordering(db: &dyn Db, left: TypeIsType, right: TypeIsType) -> Ordering {
+fn guard_like_ordering<'db, T: TypeGuardLike<'db>>(db: &'db dyn Db, left: T, right: T) -> Ordering {
     let (left_ty, right_ty) = (left.return_type(db), right.return_type(db));
 
     match (left.place_info(db), right.place_info(db)) {
@@ -300,4 +320,14 @@ fn typeis_ordering(db: &dyn Db, left: TypeIsType, right: TypeIsType) -> Ordering
             ordering => ordering,
         },
     }
+}
+
+/// Determine a canonical order for two instances of [`TypeIsType`].
+fn typeis_ordering(db: &dyn Db, left: TypeIsType, right: TypeIsType) -> Ordering {
+    guard_like_ordering(db, left, right)
+}
+
+/// Determine a canonical order for two instances of [`TypeGuardType`].
+fn typeguard_ordering(db: &dyn Db, left: TypeGuardType, right: TypeGuardType) -> Ordering {
+    guard_like_ordering(db, left, right)
 }

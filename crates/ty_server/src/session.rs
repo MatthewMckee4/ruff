@@ -1,6 +1,6 @@
 //! Data model, state management, and configuration resolution.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::panic::RefUnwindSafe;
 use std::sync::Arc;
@@ -9,17 +9,18 @@ use anyhow::{Context, anyhow};
 use lsp_server::{Message, RequestId};
 use lsp_types::notification::{DidChangeWatchedFiles, Exit, Notification};
 use lsp_types::request::{
-    DocumentDiagnosticRequest, RegisterCapability, Rename, Request, Shutdown, UnregisterCapability,
+    DocumentDiagnosticRequest, RegisterCapability, Request, Shutdown, UnregisterCapability,
     WorkspaceDiagnosticRequest,
 };
 use lsp_types::{
-    DiagnosticRegistrationOptions, DiagnosticServerCapabilities,
+    ClientInfo, DiagnosticRegistrationOptions, DiagnosticServerCapabilities,
     DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, Registration, RegistrationParams,
     TextDocumentContentChangeEvent, Unregistration, UnregistrationParams, Url,
 };
 use ruff_db::Db;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::{System, SystemPath, SystemPathBuf};
+use ruff_python_ast::PySourceType;
 use ty_combine::Combine;
 use ty_project::metadata::Options;
 use ty_project::watch::{ChangeEvent, CreatedKind};
@@ -27,13 +28,12 @@ use ty_project::{ChangeResult, CheckMode, Db as _, ProjectDatabase, ProjectMetad
 
 use index::DocumentError;
 use options::GlobalOptions;
+use ty_python_semantic::MisconfigurationMode;
 
 pub(crate) use self::options::InitializationOptions;
-pub use self::options::{ClientOptions, DiagnosticMode};
+pub use self::options::{ClientOptions, DiagnosticMode, WorkspaceOptions};
 pub(crate) use self::settings::{GlobalSettings, WorkspaceSettings};
-use crate::capabilities::{
-    ResolvedClientCapabilities, server_diagnostic_options, server_rename_options,
-};
+use crate::capabilities::{ResolvedClientCapabilities, server_diagnostic_options};
 use crate::document::{DocumentKey, DocumentVersion, NotebookDocument};
 use crate::server::{Action, publish_settings_diagnostics};
 use crate::session::client::Client;
@@ -68,13 +68,6 @@ pub(crate) struct Session {
 
     /// The projects across all workspaces.
     projects: BTreeMap<SystemPathBuf, ProjectState>,
-
-    /// The project to use for files outside any workspace. For example, if the user
-    /// opens the project `<home>/my_project` in VS code but they then opens a Python file from their Desktop.
-    /// This file isn't part of the active workspace, nor is it part of any project. But we still want
-    /// to provide some basic functionality like navigation, completions, syntax highlighting, etc.
-    /// That's what we use the default project for.
-    default_project: DefaultProject,
 
     /// Initialization options that were provided by the client during server initialization.
     initialization_options: InitializationOptions,
@@ -113,6 +106,9 @@ pub(crate) struct Session {
     /// Registrations is a set of LSP methods that have been dynamically registered with the
     /// client.
     registrations: HashSet<String>,
+
+    /// The name of the client (editor) that connected to this server.
+    client_name: ClientName,
 }
 
 /// LSP State for a Project
@@ -148,6 +144,7 @@ impl Session {
         workspace_urls: Vec<Url>,
         initialization_options: InitializationOptions,
         native_system: Arc<dyn System + 'static + Send + Sync + RefUnwindSafe>,
+        client_name: ClientName,
         in_test: bool,
     ) -> crate::Result<Self> {
         let index = Arc::new(Index::new());
@@ -165,7 +162,6 @@ impl Session {
             workspaces,
             deferred_messages: VecDeque::new(),
             index: Some(index),
-            default_project: DefaultProject::new(),
             initialization_options,
             global_settings: Arc::new(GlobalSettings::default()),
             projects: BTreeMap::new(),
@@ -176,6 +172,7 @@ impl Session {
             suspended_workspace_diagnostics_request: None,
             revision: 0,
             registrations: HashSet::new(),
+            client_name,
         })
     }
 
@@ -304,7 +301,7 @@ impl Session {
     /// Returns a reference to the project's [`ProjectDatabase`] in which the given `path` belongs.
     ///
     /// If the path is a system path, it will return the project database that is closest to the
-    /// given path, or the default project if no project is found for the path.
+    /// given path, or the first project if no project is found for the path.
     ///
     /// If the path is a virtual path, it will return the first project database in the session.
     pub(crate) fn project_db(&self, path: &AnySystemPath) -> &ProjectDatabase {
@@ -341,15 +338,17 @@ impl Session {
     /// Returns a reference to the project's [`ProjectState`] in which the given `path` belongs.
     ///
     /// If the path is a system path, it will return the project database that is closest to the
-    /// given path, or the default project if no project is found for the path.
+    /// given path, or the first project if no project is found for the path.
     ///
     /// If the path is a virtual path, it will return the first project database in the session.
     pub(crate) fn project_state(&self, path: &AnySystemPath) -> &ProjectState {
         match path {
             AnySystemPath::System(system_path) => {
                 self.project_state_for_path(system_path).unwrap_or_else(|| {
-                    self.default_project
-                        .get(self.index.as_ref(), &self.native_system)
+                    self.projects
+                        .values()
+                        .next()
+                        .expect("To always have at least one project")
                 })
             }
             AnySystemPath::SystemVirtual(_virtual_path) => {
@@ -373,15 +372,22 @@ impl Session {
     /// [`project_db`]: Session::project_db
     pub(crate) fn project_state_mut(&mut self, path: &AnySystemPath) -> &mut ProjectState {
         match path {
-            AnySystemPath::System(system_path) => self
-                .projects
-                .range_mut(..=system_path.to_path_buf())
-                .next_back()
-                .map(|(_, project)| project)
-                .unwrap_or_else(|| {
-                    self.default_project
-                        .get_mut(self.index.as_ref(), &self.native_system)
-                }),
+            AnySystemPath::System(system_path) => {
+                let range = ..=system_path.to_path_buf();
+
+                // Using `range` here to work around a borrow checker limitation
+                // where it can't prove that the `range_mut` call and the `self.projects.values_mut`
+                // never borrow `self.projects` mutably at the same time.
+                // https://rust-lang.github.io/rfcs/2094-nll.html#problem-case-3-conditional-control-flow-across-functions
+                if self.projects.range(range.clone()).next_back().is_some() {
+                    return self.projects.range_mut(range).next_back().unwrap().1;
+                }
+
+                // TODO: Currently, ty only supports single workspaces but we need to figure out
+                // which project to use when we support multiple projects (e.g. look for the first project
+                // with an overlapping search path?)
+                self.projects.values_mut().next().unwrap()
+            }
             AnySystemPath::SystemVirtual(_virtual_path) => {
                 // TODO: Currently, ty only supports single workspace but we need to figure out
                 // which project should this virtual path belong to when there are multiple
@@ -426,19 +432,14 @@ impl Session {
             .apply_changes(changes, overrides.as_ref())
     }
 
-    /// Returns a mutable iterator over all project databases that have been initialized to this point.
-    ///
-    /// This iterator will only yield the default project database if it has been used.
+    /// Returns a mutable iterator over all project databases.
     pub(crate) fn projects_mut(&mut self) -> impl Iterator<Item = &'_ mut ProjectDatabase> + '_ {
         self.project_states_mut().map(|project| &mut project.db)
     }
 
-    /// Returns a mutable iterator over all projects that have been initialized to this point.
-    ///
-    /// This iterator will only yield the default project if it has been used.
+    /// Returns a mutable iterator over all projects.
     pub(crate) fn project_states_mut(&mut self) -> impl Iterator<Item = &'_ mut ProjectState> + '_ {
-        let default_project = self.default_project.try_get_mut();
-        self.projects.values_mut().chain(default_project)
+        self.projects.values_mut()
     }
 
     pub(crate) fn initialize_workspaces(
@@ -453,8 +454,6 @@ impl Session {
         let mut combined_global_options: Option<GlobalOptions> = None;
 
         for (url, options) in workspace_settings {
-            tracing::debug!("Initializing workspace `{url}`");
-
             // Combine the global options specified during initialization with the
             // workspace-specific options to create the final workspace options.
             let ClientOptions {
@@ -465,37 +464,34 @@ impl Session {
                 .clone()
                 .combine(options.clone());
 
+            tracing::debug!("Initializing workspace `{url}`: {workspace:#?}");
+
             let unknown_options = &options.unknown;
             if !unknown_options.is_empty() {
-                // HACK: This is to ensure that users with an older version of the ty VS Code
-                // extension don't get warnings about unknown options when they are using a newer
-                // version of the language server. This should be removed after a few releases.
-                if !unknown_options.contains_key("importStrategy")
-                    && !unknown_options.contains_key("interpreter")
-                {
-                    tracing::warn!(
-                        "Received unknown options for workspace `{url}`: {}",
-                        serde_json::to_string_pretty(unknown_options)
-                            .unwrap_or_else(|_| format!("{unknown_options:?}"))
-                    );
-
-                    client.show_warning_message(format!(
-                        "Received unknown options for workspace `{url}`: '{}'. \
-                        Refer to the logs for more details.",
-                        unknown_options
-                            .keys()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .join("', '")
-                    ));
-                }
+                warn_about_unknown_options(client, Some(&url), unknown_options);
             }
 
             combined_global_options.combine_with(Some(global));
 
-            let workspace_settings = workspace.into_settings();
-            let Some((root, workspace)) = self.workspaces.initialize(&url, workspace_settings)
-            else {
+            let Ok(root) = url.to_file_path() else {
+                tracing::debug!("Ignoring workspace with non-path root: {url}");
+                continue;
+            };
+
+            // Realistically I don't think this can fail because we got the path from a Url
+            let root = match SystemPathBuf::from_path_buf(root) {
+                Ok(root) => root,
+                Err(root) => {
+                    tracing::debug!(
+                        "Ignoring workspace with non-UTF8 root: {root}",
+                        root = root.display()
+                    );
+                    continue;
+                }
+            };
+
+            let workspace_settings = workspace.into_settings(&root, client);
+            let Some(workspace) = self.workspaces.initialize(&root, workspace_settings) else {
                 continue;
             };
 
@@ -507,7 +503,18 @@ impl Session {
                 self.native_system.clone(),
             );
 
-            let project = ProjectMetadata::discover(&root, &system)
+            let configuration_file = workspace
+                .settings
+                .project_options_overrides()
+                .and_then(|settings| settings.config_file_override.as_ref());
+
+            let metadata = if let Some(configuration_file) = configuration_file {
+                ProjectMetadata::from_config_file(configuration_file.clone(), &root, &system)
+            } else {
+                ProjectMetadata::discover(&root, &system)
+            };
+
+            let project = metadata
                 .context("Failed to discover project configuration")
                 .and_then(|mut metadata| {
                     metadata
@@ -525,20 +532,24 @@ impl Session {
                 Ok(db) => (root, db),
                 Err(err) => {
                     tracing::error!(
-                        "Failed to create project for `{root}`: {err:#}. \
+                        "Failed to create project for workspace `{url}`: {err:#}. \
                         Falling back to default settings"
                     );
 
                     client.show_error_message(format!(
-                        "Failed to load project rooted at {root}. \
-                        Please refer to the logs for more details.",
+                        "Failed to load project for workspace {url}. {}",
+                        self.client_name.log_guidance(),
                     ));
 
-                    let db_with_default_settings =
-                        ProjectMetadata::from_options(Options::default(), root, None)
-                            .context("Failed to convert default options to metadata")
-                            .and_then(|metadata| ProjectDatabase::new(metadata, system))
-                            .expect("Default configuration to be valid");
+                    let db_with_default_settings = ProjectMetadata::from_options(
+                        Options::default(),
+                        root,
+                        None,
+                        MisconfigurationMode::UseDefault,
+                    )
+                    .context("Failed to convert default options to metadata")
+                    .and_then(|metadata| ProjectDatabase::new(metadata, system))
+                    .expect("Default configuration to be valid");
                     let default_root = db_with_default_settings
                         .project()
                         .root(&db_with_default_settings)
@@ -564,7 +575,7 @@ impl Session {
             publish_settings_diagnostics(self, client, root);
         }
 
-        if let Some(global_options) = combined_global_options.take() {
+        if let Some(global_options) = combined_global_options {
             let global_settings = global_options.into_settings();
             if global_settings.diagnostic_mode().is_workspace() {
                 for project in self.projects.values_mut() {
@@ -603,7 +614,6 @@ impl Session {
     /// `ty.experimental.rename` global setting.
     fn register_capabilities(&mut self, client: &Client) {
         static DIAGNOSTIC_REGISTRATION_ID: &str = "ty/textDocument/diagnostic";
-        static RENAME_REGISTRATION_ID: &str = "ty/textDocument/rename";
         static FILE_WATCHER_REGISTRATION_ID: &str = "ty/workspace/didChangeWatchedFiles";
 
         let mut registrations = vec![];
@@ -625,48 +635,34 @@ impl Session {
 
             let diagnostic_mode = self.global_settings.diagnostic_mode;
 
-            tracing::debug!(
-                "Registering diagnostic capability with {diagnostic_mode:?} diagnostic mode"
-            );
-            registrations.push(Registration {
-                id: DIAGNOSTIC_REGISTRATION_ID.into(),
-                method: DocumentDiagnosticRequest::METHOD.into(),
-                register_options: Some(
-                    serde_json::to_value(DiagnosticServerCapabilities::RegistrationOptions(
-                        DiagnosticRegistrationOptions {
-                            diagnostic_options: server_diagnostic_options(
-                                diagnostic_mode.is_workspace(),
-                            ),
-                            ..Default::default()
-                        },
-                    ))
-                    .unwrap(),
-                ),
-            });
-        }
-
-        if self
-            .resolved_client_capabilities
-            .supports_rename_dynamic_registration()
-        {
-            let is_rename_enabled = self.global_settings.is_rename_enabled();
-
-            if !is_rename_enabled {
-                tracing::debug!("Rename capability is disabled in the resolved global settings");
-                if self.registrations.contains(Rename::METHOD) {
-                    unregistrations.push(Unregistration {
-                        id: RENAME_REGISTRATION_ID.into(),
-                        method: Rename::METHOD.into(),
+            match diagnostic_mode {
+                DiagnosticMode::Off => {
+                    tracing::debug!(
+                        "Skipping registration of diagnostic capability because diagnostics are turned off"
+                    );
+                }
+                DiagnosticMode::OpenFilesOnly | DiagnosticMode::Workspace => {
+                    tracing::debug!(
+                        "Registering diagnostic capability with {diagnostic_mode:?} diagnostic mode"
+                    );
+                    registrations.push(Registration {
+                        id: DIAGNOSTIC_REGISTRATION_ID.into(),
+                        method: DocumentDiagnosticRequest::METHOD.into(),
+                        register_options: Some(
+                            serde_json::to_value(
+                                DiagnosticServerCapabilities::RegistrationOptions(
+                                    DiagnosticRegistrationOptions {
+                                        diagnostic_options: server_diagnostic_options(
+                                            diagnostic_mode.is_workspace(),
+                                        ),
+                                        ..Default::default()
+                                    },
+                                ),
+                            )
+                            .unwrap(),
+                        ),
                     });
                 }
-            }
-
-            if is_rename_enabled {
-                registrations.push(Registration {
-                    id: RENAME_REGISTRATION_ID.into(),
-                    method: Rename::METHOD.into(),
-                    register_options: Some(serde_json::to_value(server_rename_options()).unwrap()),
-                });
             }
         }
 
@@ -801,7 +797,7 @@ impl Session {
             let paths = self
                 .project_dbs()
                 .flat_map(|db| {
-                    ty_python_semantic::system_module_search_paths(db).map(move |path| (db, path))
+                    ty_module_resolver::system_module_search_paths(db).map(move |path| (db, path))
                 })
                 .filter(|(db, path)| !path.starts_with(db.project().root(*db)))
                 .map(|(_, path)| path)
@@ -828,6 +824,7 @@ impl Session {
                 .unwrap_or_else(|| Arc::new(WorkspaceSettings::default())),
             position_encoding: self.position_encoding,
             document: document_handle,
+            client_name: self.client_name,
         })
     }
 
@@ -846,6 +843,7 @@ impl Session {
             in_test: self.in_test,
             resolved_client_capabilities: self.resolved_client_capabilities,
             revision: self.revision,
+            client_name: self.client_name,
         }
     }
 
@@ -915,7 +913,15 @@ impl Session {
 
                 let db = self.project_db_mut(path);
                 match system_path_to_file(db, system_path) {
-                    Ok(file) => db.project().open_file(db, file),
+                    Ok(file) => {
+                        let project = db.project();
+
+                        // Only mark this file as open if it's part of the project.
+                        // This ensures that we don't show diagnostics for files outside the project.
+                        if project.is_file_included(db, system_path) {
+                            project.open_file(db, file);
+                        }
+                    }
                     Err(err) => tracing::warn!("Failed to open file {system_path}: {err}"),
                 }
             }
@@ -977,6 +983,10 @@ impl Session {
     pub(crate) fn position_encoding(&self) -> PositionEncoding {
         self.position_encoding
     }
+
+    pub(crate) fn client_name(&self) -> ClientName {
+        self.client_name
+    }
 }
 
 /// A guard that holds the only reference to the index and allows modifying it.
@@ -1026,6 +1036,7 @@ pub(crate) struct DocumentSnapshot {
     workspace_settings: Arc<WorkspaceSettings>,
     position_encoding: PositionEncoding,
     document: DocumentHandle,
+    client_name: ClientName,
 }
 
 impl DocumentSnapshot {
@@ -1072,6 +1083,10 @@ impl DocumentSnapshot {
     pub(crate) fn notebook_or_file_path(&self) -> &AnySystemPath {
         self.document.notebook_or_file_path()
     }
+
+    pub(crate) fn client_name(&self) -> ClientName {
+        self.client_name
+    }
 }
 
 /// An immutable snapshot of the current state of [`Session`].
@@ -1082,6 +1097,7 @@ pub(crate) struct SessionSnapshot {
     resolved_client_capabilities: ResolvedClientCapabilities,
     in_test: bool,
     revision: u64,
+    client_name: ClientName,
 
     /// IMPORTANT: It's important that the databases come last, or at least,
     /// after any `Arc` that we try to extract or mutate in-place using `Arc::into_inner`
@@ -1122,6 +1138,42 @@ impl SessionSnapshot {
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn client_name(&self) -> ClientName {
+        self.client_name
+    }
+}
+
+/// Represents the client (editor) that's connected to the language server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClientName {
+    Zed,
+    Other,
+}
+
+impl From<Option<ClientInfo>> for ClientName {
+    fn from(info: Option<ClientInfo>) -> Self {
+        match info {
+            Some(info) if matches!(info.name.as_str(), "Zed") => ClientName::Zed,
+            _ => ClientName::Other,
+        }
+    }
+}
+
+impl ClientName {
+    /// Returns editor-specific guidance for finding logs.
+    ///
+    /// Different editors have different ways to access language server logs, so we provide tailored
+    /// instructions based on the connected client.
+    pub(crate) fn log_guidance(self) -> &'static str {
+        match self {
+            ClientName::Zed => {
+                "Please refer to the logs for more details \
+                    (command palette: `dev: open language server logs`)."
+            }
+            ClientName::Other => "Please refer to the logs for more details.",
+        }
     }
 }
 
@@ -1170,18 +1222,13 @@ impl Workspaces {
     /// `None` if URL doesn't map to a valid path or if the workspace is not registered.
     pub(crate) fn initialize(
         &mut self,
-        url: &Url,
+        path: &SystemPath,
         settings: WorkspaceSettings,
-    ) -> Option<(SystemPathBuf, &mut Workspace)> {
-        let path = url.to_file_path().ok()?;
-
-        // Realistically I don't think this can fail because we got the path from a Url
-        let system_path = SystemPathBuf::from_path_buf(path).ok()?;
-
-        if let Some(workspace) = self.workspaces.get_mut(&system_path) {
+    ) -> Option<&mut Workspace> {
+        if let Some(workspace) = self.workspaces.get_mut(path) {
             workspace.settings = Arc::new(settings);
             self.uninitialized -= 1;
-            Some((system_path, workspace))
+            Some(workspace)
         } else {
             None
         }
@@ -1244,63 +1291,6 @@ impl Workspace {
 
     pub(crate) fn settings_arc(&self) -> Arc<WorkspaceSettings> {
         self.settings.clone()
-    }
-}
-
-/// Thin wrapper around the default project database that ensures it only gets initialized
-/// when it's first accessed.
-///
-/// There are a few advantages to this:
-///
-/// 1. Salsa has a fast-path for query lookups for the first created database.
-///    We really want that to be the actual project database and not our fallback database.
-/// 2. The logs when the server starts can be confusing if it once shows it uses Python X (for the default db)
-///    but then has another log that it uses Python Y (for the actual project db).
-struct DefaultProject(std::sync::OnceLock<ProjectState>);
-
-impl DefaultProject {
-    pub(crate) fn new() -> Self {
-        DefaultProject(std::sync::OnceLock::new())
-    }
-
-    pub(crate) fn get(
-        &self,
-        index: Option<&Arc<Index>>,
-        fallback_system: &Arc<dyn System + 'static + Send + Sync + RefUnwindSafe>,
-    ) -> &ProjectState {
-        self.0.get_or_init(|| {
-            tracing::info!("Initializing the default project");
-
-            let index = index.unwrap();
-            let system = LSPSystem::new(index.clone(), fallback_system.clone());
-            let metadata = ProjectMetadata::from_options(
-                Options::default(),
-                system.current_directory().to_path_buf(),
-                None,
-            )
-            .unwrap();
-
-            ProjectState {
-                db: ProjectDatabase::new(metadata, system).unwrap(),
-                untracked_files_with_pushed_diagnostics: Vec::new(),
-            }
-        })
-    }
-
-    pub(crate) fn get_mut(
-        &mut self,
-        index: Option<&Arc<Index>>,
-        fallback_system: &Arc<dyn System + 'static + Send + Sync + RefUnwindSafe>,
-    ) -> &mut ProjectState {
-        let _ = self.get(index, fallback_system);
-
-        // SAFETY: The `OnceLock` is guaranteed to be initialized at this point because
-        // we called `get` above, which initializes it if it wasn't already.
-        self.0.get_mut().unwrap()
-    }
-
-    pub(crate) fn try_get_mut(&mut self) -> Option<&mut ProjectState> {
-        self.0.get_mut()
     }
 }
 
@@ -1471,7 +1461,7 @@ impl DocumentHandle {
     }
 
     pub(crate) fn update_text_document(
-        &self,
+        &mut self,
         session: &mut Session,
         content_changes: Vec<TextDocumentContentChangeEvent>,
         new_version: DocumentVersion,
@@ -1491,6 +1481,8 @@ impl DocumentHandle {
             } else {
                 document.apply_changes(content_changes, new_version, position_encoding);
             }
+
+            self.set_version(document.version());
         }
 
         self.update_in_db(session);
@@ -1499,7 +1491,7 @@ impl DocumentHandle {
     }
 
     pub(crate) fn update_notebook_document(
-        &self,
+        &mut self,
         session: &mut Session,
         cells: Option<lsp_types::NotebookDocumentCellChange>,
         metadata: Option<lsp_types::LSPObject>,
@@ -1516,6 +1508,8 @@ impl DocumentHandle {
                 new_version,
                 position_encoding,
             )?;
+
+            self.set_version(new_version);
         }
 
         self.update_in_db(session);
@@ -1536,6 +1530,16 @@ impl DocumentHandle {
         session.apply_changes(path, changes);
     }
 
+    fn set_version(&mut self, version: DocumentVersion) {
+        let self_version = match self {
+            DocumentHandle::Text { version, .. }
+            | DocumentHandle::Notebook { version, .. }
+            | DocumentHandle::Cell { version, .. } => version,
+        };
+
+        *self_version = version;
+    }
+
     /// De-registers a document, specified by its key.
     /// Calling this multiple times for the same document is a logic error.
     ///
@@ -1543,7 +1547,8 @@ impl DocumentHandle {
     pub(crate) fn close(&self, session: &mut Session) -> crate::Result<bool> {
         let is_cell = self.is_cell();
         let path = self.notebook_or_file_path();
-        session.index_mut().close_document(&self.key())?;
+
+        let removed_document = session.index_mut().close_document(&self.key())?;
 
         // Close the text or notebook file in the database but skip this
         // step for cells because closing a cell doesn't close its notebook.
@@ -1556,6 +1561,22 @@ impl DocumentHandle {
                 AnySystemPath::System(system_path) => {
                     if let Some(file) = db.files().try_system(db, system_path) {
                         db.project().close_file(db, file);
+
+                        // In case we preferred the language given by the Client
+                        // over the one detected by the file extension, remove the file
+                        // from the project to handle cases where a user changes the language
+                        // of a file (which results in a didClose and didOpen for the same path but with different languages).
+                        if removed_document.language_id().is_some()
+                            && system_path
+                                .extension()
+                                .and_then(PySourceType::try_from_extension)
+                                .is_none()
+                        {
+                            db.project().remove_file(db, file);
+                        }
+
+                        // Bump the file's revision back to using the file system's revision.
+                        file.sync(db);
                     } else {
                         // This can only fail when the path is a directory or it doesn't exists but the
                         // file should exists for this handler in this branch. This is because every
@@ -1579,6 +1600,8 @@ impl DocumentHandle {
                     if let Some(virtual_file) = db.files().try_virtual_file(virtual_path) {
                         db.project().close_file(db, virtual_file.file());
                         virtual_file.close(db);
+                        // Bump the file's revision back to using the file system's revision.
+                        virtual_file.sync(db);
                     } else {
                         tracing::warn!("Salsa virtual file does not exists for {}", virtual_path);
                     }
@@ -1594,4 +1617,30 @@ impl DocumentHandle {
 
         Ok(requires_clear_diagnostics)
     }
+}
+
+/// Warns about unknown options received by the server.
+///
+/// If `workspace_url` is `Some`, it indicates that the unknown options were received during a
+/// workspace initialization, otherwise they were received during the server initialization.
+pub(super) fn warn_about_unknown_options(
+    client: &Client,
+    workspace_url: Option<&Url>,
+    unknown_options: &HashMap<String, serde_json::Value>,
+) {
+    let message = if let Some(workspace_url) = workspace_url {
+        format!(
+            "Received unknown options for workspace `{workspace_url}`: {}",
+            serde_json::to_string_pretty(unknown_options)
+                .unwrap_or_else(|_| format!("{unknown_options:?}"))
+        )
+    } else {
+        format!(
+            "Received unknown options during initialization: {}",
+            serde_json::to_string_pretty(unknown_options)
+                .unwrap_or_else(|_| format!("{unknown_options:?}"))
+        )
+    };
+    tracing::warn!("{message}");
+    client.show_warning_message(message);
 }

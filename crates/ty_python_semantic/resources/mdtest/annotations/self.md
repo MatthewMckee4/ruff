@@ -63,6 +63,12 @@ python-version = "3.12"
 from typing import Self
 
 class A:
+    def __init__(self):
+        reveal_type(self)  # revealed: Self@__init__
+
+    def __init_subclass__(cls, default_name, **kwargs):
+        reveal_type(cls)  # revealed: type[Self@__init_subclass__]
+
     def implicit_self(self) -> Self:
         reveal_type(self)  # revealed: Self@implicit_self
 
@@ -91,8 +97,7 @@ class A:
 
     @classmethod
     def a_classmethod(cls) -> Self:
-        # TODO: This should be type[Self@bar]
-        reveal_type(cls)  # revealed: Unknown
+        reveal_type(cls)  # revealed: type[Self@a_classmethod]
         return cls()
 
     @staticmethod
@@ -188,8 +193,7 @@ class B:
 reveal_type(B().name_does_not_matter())  # revealed: B
 reveal_type(B().positional_only(1))  # revealed: B
 reveal_type(B().keyword_only(x=1))  # revealed: B
-# TODO: This should deally be `B`
-reveal_type(B().decorated_method())  # revealed: Unknown
+reveal_type(B().decorated_method())  # revealed: B
 
 reveal_type(B().a_property)  # revealed: B
 
@@ -232,6 +236,32 @@ class C:
 reveal_type(not_a_method)  # revealed: def not_a_method(self) -> Unknown
 ```
 
+## Different occurrences of `Self` represent different types
+
+Here, both `Foo.foo` and `Bar.bar` use `Self`. When accessing a bound method, we replace any
+occurrences of `Self` with the bound `self` type. In this example, when we access `x.foo`, we only
+want to substitute the occurrences of `Self` in `Foo.foo` — that is, occurrences of `Self@foo`. The
+fact that `x` is an instance of `Foo[Self@bar]` (a completely different `Self` type) should not
+affect that subtitution. If we blindly substitute all occurrences of `Self`, we would get
+`Foo[Self@bar]` as the return type of the bound method.
+
+```py
+from typing import Self
+
+class Foo[T]:
+    def foo(self: Self) -> T:
+        raise NotImplementedError
+
+class Bar:
+    def bar(self: Self, x: Foo[Self]):
+        # revealed: bound method Foo[Self@bar].foo() -> Self@bar
+        reveal_type(x.foo)
+
+def f[U: Bar](x: Foo[U]):
+    # revealed: bound method Foo[U@f].foo() -> U@f
+    reveal_type(x.foo)
+```
+
 ## typing_extensions
 
 ```toml
@@ -251,8 +281,10 @@ reveal_type(C().method())  # revealed: C
 
 ## Class Methods
 
+### Explicit
+
 ```py
-from typing import Self, TypeVar
+from typing import Self
 
 class Shape:
     def foo(self: Self) -> Self:
@@ -260,15 +292,116 @@ class Shape:
 
     @classmethod
     def bar(cls: type[Self]) -> Self:
-        # TODO: type[Shape]
-        reveal_type(cls)  # revealed: @Todo(unsupported type[X] special form)
+        reveal_type(cls)  # revealed: type[Self@bar]
         return cls()
 
 class Circle(Shape): ...
 
 reveal_type(Shape().foo())  # revealed: Shape
-# TODO: Shape
-reveal_type(Shape.bar())  # revealed: Unknown
+reveal_type(Shape.bar())  # revealed: Shape
+
+reveal_type(Circle().foo())  # revealed: Circle
+reveal_type(Circle.bar())  # revealed: Circle
+```
+
+### Implicit
+
+```py
+from typing import Self
+
+class Shape:
+    def foo(self) -> Self:
+        return self
+
+    @classmethod
+    def bar(cls) -> Self:
+        reveal_type(cls)  # revealed: type[Self@bar]
+        return cls()
+
+class Circle(Shape): ...
+
+reveal_type(Shape().foo())  # revealed: Shape
+reveal_type(Shape.bar())  # revealed: Shape
+
+reveal_type(Circle().foo())  # revealed: Circle
+reveal_type(Circle.bar())  # revealed: Circle
+```
+
+### Implicit in generic class
+
+```py
+from typing import Self
+
+class GenericShape[T]:
+    def foo(self) -> Self:
+        return self
+
+    @classmethod
+    def bar(cls) -> Self:
+        reveal_type(cls)  # revealed: type[Self@bar]
+        return cls()
+
+    @classmethod
+    def baz[U](cls, u: U) -> "GenericShape[U]":
+        reveal_type(cls)  # revealed: type[Self@baz]
+        return cls()
+
+class GenericCircle[T](GenericShape[T]): ...
+
+reveal_type(GenericShape().foo())  # revealed: GenericShape[Unknown]
+reveal_type(GenericShape.bar())  # revealed: GenericShape[Unknown]
+reveal_type(GenericShape[int].bar())  # revealed: GenericShape[int]
+reveal_type(GenericShape.baz(1))  # revealed: GenericShape[Literal[1]]
+
+reveal_type(GenericCircle().foo())  # revealed: GenericCircle[Unknown]
+reveal_type(GenericCircle.bar())  # revealed: GenericCircle[Unknown]
+reveal_type(GenericCircle[int].bar())  # revealed: GenericCircle[int]
+reveal_type(GenericCircle.baz(1))  # revealed: GenericShape[Literal[1]]
+```
+
+### Calling `super()` in overridden methods with `Self` return type
+
+This is a regression test for <https://github.com/astral-sh/ty/issues/2122>.
+
+When a child class overrides a parent method with a `Self` return type and calls `super().method()`,
+the return type should be the child's `Self` type variable, not the concrete child class type.
+
+```py
+from typing import Self
+
+class Parent:
+    def copy(self) -> Self:
+        return self
+
+class Child(Parent):
+    def copy(self) -> Self:
+        result = super().copy()
+        reveal_type(result)  # revealed: Self@copy
+        return result
+
+# When called on concrete types, Self is substituted correctly.
+reveal_type(Child().copy())  # revealed: Child
+```
+
+The same applies to classmethods with `Self` return types:
+
+```py
+from typing import Self
+
+class Parent:
+    @classmethod
+    def create(cls) -> Self:
+        return cls()
+
+class Child(Parent):
+    @classmethod
+    def create(cls) -> Self:
+        result = super().create()
+        reveal_type(result)  # revealed: Self@create
+        return result
+
+# When called on concrete types, Self is substituted correctly.
+reveal_type(Child.create())  # revealed: Child
 ```
 
 ## Attributes
@@ -321,6 +454,40 @@ class Container(Generic[T]):
 int_container: Container[int] = Container[int]()
 reveal_type(int_container)  # revealed: Container[int]
 reveal_type(int_container.set_value(1))  # revealed: Container[int]
+```
+
+## Generic class with bounded type variable
+
+This is a regression test for <https://github.com/astral-sh/ty/issues/2467>.
+
+Calling a method on a generic class instance should work when the type parameter is specialized with
+a type that satisfies a bound.
+
+```py
+from typing import NewType
+
+class Base: ...
+
+class C[T: Base]:
+    x: T
+
+    def g(self) -> None:
+        pass
+
+# Calling a method on a specialized instance should not produce an error
+C[Base]().g()
+
+# Test with a NewType bound
+K = NewType("K", int)
+
+class D[T: K]:
+    x: T
+
+    def h(self) -> None:
+        pass
+
+# Calling a method on a specialized instance should not produce an error
+D[K]().h()
 ```
 
 ## Protocols
@@ -418,8 +585,8 @@ class Baz(Bar[Self]): ...
 
 class MyMetaclass(type):
     # TODO: reject the Self usage. because self cannot be used within a metaclass.
-    def __new__(cls) -> Self:
-        return super().__new__(cls)
+    def __new__(cls, name, bases, dct) -> Self:
+        return cls(name, bases, dct)
 ```
 
 ## Explicit annotations override implicit `Self`
@@ -503,9 +670,11 @@ class C[T]():
     def f(self: Self):
         def b(x: Self):
             reveal_type(x)  # revealed: Self@f
-        reveal_type(generic_context(b))  # revealed: None
+        # revealed: None
+        reveal_type(generic_context(b))
 
-reveal_type(generic_context(C.f))  # revealed: tuple[Self@f]
+# revealed: ty_extensions.GenericContext[Self@f]
+reveal_type(generic_context(C.f))
 ```
 
 Even if the `Self` annotation appears first in the nested function, it is the method that binds
@@ -519,9 +688,11 @@ class C:
     def f(self: "C"):
         def b(x: Self):
             reveal_type(x)  # revealed: Self@f
-        reveal_type(generic_context(b))  # revealed: None
+        # revealed: None
+        reveal_type(generic_context(b))
 
-reveal_type(generic_context(C.f))  # revealed: None
+# revealed: None
+reveal_type(generic_context(C.f))
 ```
 
 ## Non-positional first parameters

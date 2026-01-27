@@ -2,27 +2,34 @@
 //! arguments against the parameters of the callable. Like with
 //! [signatures][crate::types::signatures], we have to handle the fact that the callable might be a
 //! union of types, each of which might contain multiple overloads.
+//!
+//! ### Tracing
+//!
+//! This module is instrumented with debug-level `tracing` messages. You can set the `TY_LOG`
+//! environment variable to see this output when testing locally. `tracing` log messages typically
+//! have a `target` field, which is the name of the module the message appears in — in this case,
+//! `ty_python_semantic::types::call::bind`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 
-use itertools::{Either, Itertools};
+use itertools::Itertools;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
-use crate::Program;
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
-use crate::place::{Definedness, Place};
+use crate::place::{DefinedPlace, Definedness, Place, known_module_symbol};
 use crate::types::call::arguments::{Expansion, is_expandable_type};
 use crate::types::constraints::ConstraintSet;
 use crate::types::diagnostic::{
-    CALL_NON_CALLABLE, CONFLICTING_ARGUMENT_FORMS, INVALID_ARGUMENT_TYPE, MISSING_ARGUMENT,
-    NO_MATCHING_OVERLOAD, PARAMETER_ALREADY_ASSIGNED, POSITIONAL_ONLY_PARAMETER_AS_KWARG,
-    TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT,
+    CALL_NON_CALLABLE, CALL_TOP_CALLABLE, CONFLICTING_ARGUMENT_FORMS, INVALID_ARGUMENT_TYPE,
+    INVALID_DATACLASS, MISSING_ARGUMENT, NO_MATCHING_OVERLOAD, PARAMETER_ALREADY_ASSIGNED,
+    POSITIONAL_ONLY_PARAMETER_AS_KWARG, TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT,
 };
 use crate::types::enums::is_enum_class;
 use crate::types::function::{
@@ -33,16 +40,20 @@ use crate::types::generics::{
     InferableTypeVars, Specialization, SpecializationBuilder, SpecializationError,
 };
 use crate::types::signatures::{Parameter, ParameterForm, ParameterKind, Parameters};
-use crate::types::tuple::{TupleLength, TupleType};
+use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
 use crate::types::{
-    BoundMethodType, BoundTypeVarIdentity, ClassLiteral, DATACLASS_FLAGS, DataclassFlags,
-    DataclassParams, FieldInstance, KnownBoundMethodType, KnownClass, KnownInstanceType,
+    BoundMethodType, BoundTypeVarIdentity, BoundTypeVarInstance, CallableSignature, CallableType,
+    CallableTypeKind, ClassLiteral, DATACLASS_FLAGS, DataclassFlags, DataclassParams,
+    FieldInstance, GenericAlias, KnownBoundMethodType, KnownClass, KnownInstanceType,
     MemberLookupPolicy, NominalInstanceType, PropertyInstanceType, SpecialFormType,
     TrackedConstraintSet, TypeAliasType, TypeContext, TypeVarVariance, UnionBuilder, UnionType,
-    WrapperDescriptorKind, enums, ide_support, infer_isolated_expression, todo_type,
+    WrapperDescriptorKind, enums, list_members, todo_type,
 };
+use crate::unpack::EvaluationMode;
+use crate::{DisplaySettings, Program};
 use ruff_db::diagnostic::{Annotation, Diagnostic, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, ArgOrKeyword, PythonVersion};
+use ty_module_resolver::KnownModule;
 
 /// Binding information for a possible union of callables. At a call site, the arguments must be
 /// compatible with _all_ of the types in the union for the call to be valid.
@@ -203,7 +214,7 @@ impl<'db> Bindings<'db> {
             }
         }
 
-        self.evaluate_known_cases(db, dataclass_field_specifiers);
+        self.evaluate_known_cases(db, argument_types, dataclass_field_specifiers);
 
         // In order of precedence:
         //
@@ -316,6 +327,9 @@ impl<'db> Bindings<'db> {
         }
 
         for binding in self {
+            if binding.as_result().is_ok() {
+                continue;
+            }
             let union_diag = UnionDiagnostic {
                 callable_type: self.callable_type(),
                 binding,
@@ -326,7 +340,12 @@ impl<'db> Bindings<'db> {
 
     /// Evaluates the return type of certain known callables, where we have special-case logic to
     /// determine the return type in a way that isn't directly expressible in the type system.
-    fn evaluate_known_cases(&mut self, db: &'db dyn Db, dataclass_field_specifiers: &[Type<'db>]) {
+    fn evaluate_known_cases(
+        &mut self,
+        db: &'db dyn Db,
+        argument_types: &CallArguments<'_, 'db>,
+        dataclass_field_specifiers: &[Type<'db>],
+    ) {
         let to_bool = |ty: &Option<Type<'_>>, default: bool| -> bool {
             if let Some(Type::BooleanLiteral(value)) = ty {
                 *value
@@ -595,6 +614,31 @@ impl<'db> Bindings<'db> {
                         }
                     }
 
+                    Type::DataclassDecorator(params) => match overload.parameter_types() {
+                        [Some(Type::ClassLiteral(class_literal))] => {
+                            if let Some(target) = invalid_dataclass_target(db, class_literal) {
+                                overload
+                                    .errors
+                                    .push(BindingError::InvalidDataclassApplication(target));
+                            } else {
+                                overload.set_return_type(Type::from(
+                                    class_literal.with_dataclass_params(db, Some(params)),
+                                ));
+                            }
+                        }
+                        [Some(Type::GenericAlias(generic_alias))] => {
+                            let new_origin = generic_alias
+                                .origin(db)
+                                .with_dataclass_params(db, Some(params));
+                            overload.set_return_type(Type::GenericAlias(GenericAlias::new(
+                                db,
+                                new_origin,
+                                generic_alias.specialization(db),
+                            )));
+                        }
+                        _ => {}
+                    },
+
                     Type::BoundMethod(bound_method)
                         if bound_method.self_instance(db).is_property_instance() =>
                     {
@@ -646,7 +690,7 @@ impl<'db> Bindings<'db> {
                         if let Some(enum_instance) = bound_method.self_instance(db).to_instance(db)
                         {
                             overload.set_return_type(
-                                KnownClass::Iterator.to_specialized_instance(db, [enum_instance]),
+                                KnownClass::Iterator.to_specialized_instance(db, &[enum_instance]),
                             );
                         }
                     }
@@ -655,25 +699,32 @@ impl<'db> Bindings<'db> {
                         if dataclass_field_specifiers.contains(&function)
                             || function_type.is_known(db, KnownFunction::Field) =>
                     {
-                        let has_default_value = overload
-                            .parameter_type_by_name("default", false)
-                            .is_ok_and(|ty| ty.is_some())
-                            || overload
-                                .parameter_type_by_name("default_factory", false)
-                                .is_ok_and(|ty| ty.is_some())
-                            || overload
-                                .parameter_type_by_name("factory", false)
-                                .is_ok_and(|ty| ty.is_some());
+                        // Helper to get the type of a keyword argument by name. We first try to get it from
+                        // the parameter binding (for explicit parameters), and then fall back to checking the
+                        // call site arguments (for field-specifier functions that use a `**kwargs` parameter,
+                        // instead of specifying `init`, `default` etc. explicitly).
+                        let get_argument_type = |name, fallback_to_default| -> Option<Type<'db>> {
+                            if let Ok(ty) =
+                                overload.parameter_type_by_name(name, fallback_to_default)
+                            {
+                                return ty;
+                            }
+                            argument_types.iter().find_map(|(arg, ty)| {
+                                if matches!(arg, Argument::Keyword(arg_name) if arg_name == name) {
+                                    ty
+                                } else {
+                                    None
+                                }
+                            })
+                        };
 
-                        let init = overload
-                            .parameter_type_by_name("init", true)
-                            .unwrap_or(None);
-                        let kw_only = overload
-                            .parameter_type_by_name("kw_only", true)
-                            .unwrap_or(None);
-                        let alias = overload
-                            .parameter_type_by_name("alias", true)
-                            .unwrap_or(None);
+                        let has_default_value = get_argument_type("default", false).is_some()
+                            || get_argument_type("default_factory", false).is_some()
+                            || get_argument_type("factory", false).is_some();
+
+                        let init = get_argument_type("init", true);
+                        let kw_only = get_argument_type("kw_only", true);
+                        let alias = get_argument_type("alias", true);
 
                         // `dataclasses.field` and field-specifier functions of commonly used
                         // libraries like `pydantic`, `attrs`, and `SQLAlchemy` all return
@@ -782,49 +833,71 @@ impl<'db> Bindings<'db> {
 
                         Some(KnownFunction::GenericContext) => {
                             if let [Some(ty)] = overload.parameter_types() {
-                                let function_generic_context = |function: FunctionType<'db>| {
-                                    let union = UnionType::from_elements(
-                                        db,
-                                        function
-                                            .signature(db)
-                                            .overloads
-                                            .iter()
-                                            .filter_map(|signature| signature.generic_context)
-                                            .map(|generic_context| generic_context.as_tuple(db)),
-                                    );
-                                    if union.is_never() {
-                                        Type::none(db)
-                                    } else {
-                                        union
-                                    }
+                                let wrap_generic_context = |generic_context| {
+                                    Type::KnownInstance(KnownInstanceType::GenericContext(
+                                        generic_context,
+                                    ))
                                 };
 
-                                // TODO: Handle generic functions, and unions/intersections of
-                                // generic types
-                                overload.set_return_type(match ty {
-                                    Type::ClassLiteral(class) => class
-                                        .generic_context(db)
-                                        .map(|generic_context| generic_context.as_tuple(db))
-                                        .unwrap_or_else(|| Type::none(db)),
+                                let signature_generic_context =
+                                    |signature: &CallableSignature<'db>| {
+                                        UnionType::try_from_elements(
+                                            db,
+                                            signature.overloads.iter().map(|signature| {
+                                                signature.generic_context.map(wrap_generic_context)
+                                            }),
+                                        )
+                                    };
 
-                                    Type::FunctionLiteral(function) => {
-                                        function_generic_context(*function)
+                                let generic_context_for_simple_type = |ty: Type<'db>| match ty {
+                                    Type::ClassLiteral(class) => {
+                                        class.generic_context(db).map(wrap_generic_context)
                                     }
 
-                                    Type::BoundMethod(bound_method) => {
-                                        function_generic_context(bound_method.function(db))
+                                    Type::FunctionLiteral(function) => {
+                                        signature_generic_context(function.signature(db))
+                                    }
+
+                                    Type::BoundMethod(bound_method) => signature_generic_context(
+                                        bound_method.function(db).signature(db),
+                                    ),
+
+                                    Type::Callable(callable) => {
+                                        signature_generic_context(callable.signatures(db))
                                     }
 
                                     Type::KnownInstance(KnownInstanceType::TypeAliasType(
                                         TypeAliasType::PEP695(alias),
-                                    )) => alias
-                                        .generic_context(db)
-                                        .map(|generic_context| generic_context.as_tuple(db))
-                                        .unwrap_or_else(|| Type::none(db)),
+                                    )) => alias.generic_context(db).map(wrap_generic_context),
 
-                                    _ => Type::none(db),
-                                });
+                                    _ => None,
+                                };
+
+                                let generic_context = match ty {
+                                    Type::Union(union_type) => UnionType::try_from_elements(
+                                        db,
+                                        union_type
+                                            .elements(db)
+                                            .iter()
+                                            .map(|ty| generic_context_for_simple_type(*ty)),
+                                    ),
+                                    _ => generic_context_for_simple_type(*ty),
+                                };
+
+                                overload.set_return_type(
+                                    generic_context.unwrap_or_else(|| Type::none(db)),
+                                );
                             }
+                        }
+
+                        Some(KnownFunction::IntoCallable) => {
+                            let [Some(ty)] = overload.parameter_types() else {
+                                continue;
+                            };
+                            let Some(callables) = ty.try_upcast_to_callable(db) else {
+                                continue;
+                            };
+                            overload.set_return_type(callables.into_type(db));
                         }
 
                         Some(KnownFunction::DunderAllNames) => {
@@ -882,7 +955,7 @@ impl<'db> Bindings<'db> {
                             if let [Some(ty)] = overload.parameter_types() {
                                 overload.set_return_type(Type::heterogeneous_tuple(
                                     db,
-                                    ide_support::all_members(db, *ty)
+                                    list_members::all_members(db, *ty)
                                         .into_iter()
                                         .sorted()
                                         .map(|member| Type::string_literal(db, &member.name)),
@@ -907,6 +980,18 @@ impl<'db> Bindings<'db> {
                         Some(KnownFunction::Cast) => {
                             if let [Some(casted_ty), Some(_)] = overload.parameter_types() {
                                 overload.set_return_type(*casted_ty);
+                            }
+                        }
+
+                        // TODO: Remove this special handling once we have full support for
+                        // generic protocols in the solver.
+                        Some(KnownFunction::AsyncContextManager) => {
+                            if let [Some(callable)] = overload.parameter_types() {
+                                if let Some(return_ty) =
+                                    asynccontextmanager_return_type(db, *callable)
+                                {
+                                    overload.set_return_type(return_ty);
+                                }
                             }
                         }
 
@@ -936,7 +1021,7 @@ impl<'db> Bindings<'db> {
                                     let specialization = UnionType::from_elements(db, member_names);
                                     overload.set_return_type(
                                         KnownClass::FrozenSet
-                                            .to_specialized_instance(db, [specialization]),
+                                            .to_specialized_instance(db, &[specialization]),
                                     );
                                 }
                             }
@@ -965,7 +1050,11 @@ impl<'db> Bindings<'db> {
                             // TODO: we could emit a diagnostic here (if default is not set)
                             overload.set_return_type(
                                 match instance_ty.static_member(db, attr_name.value(db)) {
-                                    Place::Defined(ty, _, Definedness::AlwaysDefined) => {
+                                    Place::Defined(DefinedPlace {
+                                        ty,
+                                        definedness: Definedness::AlwaysDefined,
+                                        ..
+                                    }) => {
                                         if ty.is_dynamic() {
                                             // Here, we attempt to model the fact that an attribute lookup on
                                             // a dynamic type could fail
@@ -975,9 +1064,11 @@ impl<'db> Bindings<'db> {
                                             ty
                                         }
                                     }
-                                    Place::Defined(ty, _, Definedness::PossiblyUndefined) => {
-                                        union_with_default(ty)
-                                    }
+                                    Place::Defined(DefinedPlace {
+                                        ty,
+                                        definedness: Definedness::PossiblyUndefined,
+                                        ..
+                                    }) => union_with_default(ty),
                                     Place::Undefined => default,
                                 },
                             );
@@ -1051,21 +1142,20 @@ impl<'db> Bindings<'db> {
                                 overload.set_return_type(Type::DataclassDecorator(params));
                             }
 
-                            // `dataclass` being used as a non-decorator
-                            if let [Some(Type::ClassLiteral(class_literal))] =
+                            // `dataclass` being used as a non-decorator (i.e., `dataclass(SomeClass)`)
+                            if let [Some(Type::ClassLiteral(class_literal)), ..] =
                                 overload.parameter_types()
                             {
-                                let params = DataclassParams::default_params(db);
-                                overload.set_return_type(Type::from(ClassLiteral::new(
-                                    db,
-                                    class_literal.name(db),
-                                    class_literal.body_scope(db),
-                                    class_literal.known(db),
-                                    class_literal.deprecated(db),
-                                    class_literal.type_check_only(db),
-                                    Some(params),
-                                    class_literal.dataclass_transformer_params(db),
-                                )));
+                                if let Some(target) = invalid_dataclass_target(db, class_literal) {
+                                    overload
+                                        .errors
+                                        .push(BindingError::InvalidDataclassApplication(target));
+                                } else {
+                                    let params = DataclassParams::default_params(db);
+                                    overload.set_return_type(Type::from(
+                                        class_literal.with_dataclass_params(db, Some(params)),
+                                    ));
+                                }
                             }
                         }
 
@@ -1116,44 +1206,102 @@ impl<'db> Bindings<'db> {
                             // Ideally, either the implementation, or exactly one of the overloads
                             // of the function can have the dataclass_transform decorator applied.
                             // However, we do not yet enforce this, and in the case of multiple
-                            // applications of the decorator, we will only consider the last one
-                            // for the return value, since the prior ones will be over-written.
-                            let return_type = function_type
+                            // applications of the decorator, we will only consider the last one.
+                            let transformer_params = function_type
                                 .iter_overloads_and_implementation(db)
-                                .filter_map(|function_overload| {
-                                    function_overload.dataclass_transformer_params(db).map(
-                                        |params| {
-                                            // This is a call to a custom function that was decorated with `@dataclass_transformer`.
-                                            // If this function was called with a keyword argument like `order=False`, we extract
-                                            // the argument type and overwrite the corresponding flag in `dataclass_params` after
-                                            // constructing them from the `dataclass_transformer`-parameter defaults.
+                                .rev()
+                                .find_map(|function_overload| {
+                                    function_overload.dataclass_transformer_params(db)
+                                });
 
-                                            let dataclass_params =
-                                                DataclassParams::from_transformer_params(
-                                                    db, params,
-                                                );
-                                            let mut flags = dataclass_params.flags(db);
+                            if let Some(params) = transformer_params {
+                                // If this function was called with a keyword argument like
+                                // `order=False`, we extract the argument type and overwrite
+                                // the corresponding flag in `dataclass_params`.
+                                let dataclass_params =
+                                    DataclassParams::from_transformer_params(db, params);
+                                let mut flags = dataclass_params.flags(db);
 
-                                            for (param, flag) in DATACLASS_FLAGS {
-                                                if let Ok(Some(Type::BooleanLiteral(value))) =
-                                                    overload.parameter_type_by_name(param, false)
-                                                {
-                                                    flags.set(*flag, value);
-                                                }
-                                            }
+                                for (param, flag) in DATACLASS_FLAGS {
+                                    if let Ok(Some(Type::BooleanLiteral(value))) =
+                                        overload.parameter_type_by_name(param, false)
+                                    {
+                                        flags.set(*flag, value);
+                                    }
+                                }
 
-                                            Type::DataclassDecorator(DataclassParams::new(
-                                                db,
-                                                flags,
-                                                dataclass_params.field_specifiers(db),
-                                            ))
-                                        },
-                                    )
-                                })
-                                .last();
+                                let dataclass_params = DataclassParams::new(
+                                    db,
+                                    flags,
+                                    dataclass_params.field_specifiers(db),
+                                );
 
-                            if let Some(return_type) = return_type {
-                                overload.set_return_type(return_type);
+                                // The dataclass_transform spec doesn't clarify how to tell whether
+                                // a decorated function is a decorator or a decorator factory. We
+                                // use heuristics based on the number and type of positional arguments:
+                                //
+                                // - Zero positional arguments: assume it's a decorator factory.
+                                // - More than one positional argument: assume it's a decorator factory.
+                                // - Exactly one positional argument that's a class: ambiguous, so check
+                                //   the return type to disambiguate (class-like means decorate directly).
+                                let mut positional_args = overload
+                                    .signature
+                                    .parameters()
+                                    .iter()
+                                    .zip(overload.parameter_types())
+                                    .filter(|(param, ty)| ty.is_some() && !param.is_keyword_only())
+                                    .map(|(_, ty)| ty);
+
+                                let first_positional = positional_args.next();
+                                let has_more = positional_args.next().is_some();
+
+                                // Only attempt direct decoration if exactly one positional argument.
+                                if !has_more {
+                                    // Helper to check if return type is class-like.
+                                    let returns_class = || {
+                                        matches!(
+                                            overload.return_type(),
+                                            Type::ClassLiteral(_)
+                                                | Type::GenericAlias(_)
+                                                | Type::SubclassOf(_)
+                                        )
+                                    };
+
+                                    match first_positional {
+                                        Some(Some(Type::ClassLiteral(class_literal)))
+                                            if returns_class() =>
+                                        {
+                                            overload.set_return_type(Type::from(
+                                                class_literal.with_dataclass_params(
+                                                    db,
+                                                    Some(dataclass_params),
+                                                ),
+                                            ));
+                                            continue;
+                                        }
+                                        Some(Some(Type::GenericAlias(generic_alias)))
+                                            if returns_class() =>
+                                        {
+                                            let new_origin = generic_alias
+                                                .origin(db)
+                                                .with_dataclass_params(db, Some(dataclass_params));
+                                            overload.set_return_type(Type::GenericAlias(
+                                                GenericAlias::new(
+                                                    db,
+                                                    new_origin,
+                                                    generic_alias.specialization(db),
+                                                ),
+                                            ));
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // Zero or more than one positional argument, or the argument is
+                                // not a class: assume it's a decorator factory.
+                                overload
+                                    .set_return_type(Type::DataclassDecorator(dataclass_params));
                             }
                         }
                     },
@@ -1268,6 +1416,28 @@ impl<'db> Bindings<'db> {
                         overload.set_return_type(Type::BooleanLiteral(result));
                     }
 
+                    Type::KnownBoundMethod(
+                        KnownBoundMethodType::GenericContextSpecializeConstrained(generic_context),
+                    ) => {
+                        let [Some(constraints)] = overload.parameter_types() else {
+                            continue;
+                        };
+                        let Type::KnownInstance(KnownInstanceType::ConstraintSet(constraints)) =
+                            constraints
+                        else {
+                            continue;
+                        };
+                        let specialization =
+                            generic_context.specialize_constrained(db, constraints.constraints(db));
+                        let result = match specialization {
+                            Ok(specialization) => Type::KnownInstance(
+                                KnownInstanceType::Specialization(specialization),
+                            ),
+                            Err(()) => Type::none(db),
+                        };
+                        overload.set_return_type(result);
+                    }
+
                     Type::ClassLiteral(class) => match class.known(db) {
                         Some(KnownClass::Bool) => match overload.parameter_types() {
                             [Some(arg)] => overload.set_return_type(arg.bool(db).into_type(db)),
@@ -1280,12 +1450,6 @@ impl<'db> Bindings<'db> {
                                 [Some(arg)] => overload.set_return_type(arg.str(db)),
                                 [None] => overload.set_return_type(Type::string_literal(db, "")),
                                 _ => {}
-                            }
-                        }
-
-                        Some(KnownClass::Type) if overload_index == 0 => {
-                            if let [Some(arg)] = overload.parameter_types() {
-                                overload.set_return_type(arg.dunder_class(db));
                             }
                         }
 
@@ -1322,7 +1486,7 @@ impl<'db> Bindings<'db> {
                     },
 
                     Type::SpecialForm(SpecialFormType::TypedDict) => {
-                        overload.set_return_type(todo_type!("Support for `TypedDict`"));
+                        overload.set_return_type(todo_type!("Support for functional `TypedDict`"));
                     }
 
                     // Not a special case
@@ -1531,6 +1695,19 @@ impl<'db> CallableBinding<'db> {
         // before checking.
         let argument_types = argument_types.with_self(self.bound_type);
 
+        let _span = tracing::trace_span!(
+            "CallableBinding::check_types",
+            arguments = %argument_types.display(db),
+            signature = %self.signature_type.display(db),
+        )
+        .entered();
+
+        tracing::trace!(
+            target: "ty_python_semantic::types::call::bind",
+            matching_overload_index = ?self.matching_overload_index(),
+            "after step 1",
+        );
+
         // Step 1: Check the result of the arity check which is done by `match_parameters`
         let matching_overload_indexes = match self.matching_overload_index() {
             MatchingOverloadIndex::None => {
@@ -1561,6 +1738,12 @@ impl<'db> CallableBinding<'db> {
             overload.check_types(db, argument_types.as_ref(), call_expression_tcx);
         }
 
+        tracing::trace!(
+            target: "ty_python_semantic::types::call::bind",
+            matching_overload_index = ?self.matching_overload_index(),
+            "after step 2",
+        );
+
         match self.matching_overload_index() {
             MatchingOverloadIndex::None => {
                 // If all overloads result in errors, proceed to step 3.
@@ -1572,6 +1755,12 @@ impl<'db> CallableBinding<'db> {
             MatchingOverloadIndex::Multiple(indexes) => {
                 // If two or more candidate overloads remain, proceed to step 4.
                 self.filter_overloads_containing_variadic(&indexes);
+
+                tracing::trace!(
+                    target: "ty_python_semantic::types::call::bind",
+                    matching_overload_index = ?self.matching_overload_index(),
+                    "after step 4",
+                );
 
                 match self.matching_overload_index() {
                     MatchingOverloadIndex::None => {
@@ -1590,6 +1779,12 @@ impl<'db> CallableBinding<'db> {
                             db,
                             argument_types.as_ref(),
                             &indexes,
+                        );
+
+                        tracing::trace!(
+                            target: "ty_python_semantic::types::call::bind",
+                            matching_overload_index = ?self.matching_overload_index(),
+                            "after step 5",
                         );
                     }
                 }
@@ -1625,9 +1820,8 @@ impl<'db> CallableBinding<'db> {
             let mut is_argument_assignable_to_any_overload = false;
             'overload: for overload in &self.overloads {
                 for parameter_index in &overload.argument_matches[argument_index].parameters {
-                    let parameter_type = overload.signature.parameters()[*parameter_index]
-                        .annotated_type()
-                        .unwrap_or(Type::unknown());
+                    let parameter_type =
+                        overload.signature.parameters()[*parameter_index].annotated_type();
                     if argument_type
                         .when_assignable_to(db, parameter_type, overload.inferable_typevars)
                         .is_always_satisfied(db)
@@ -1693,11 +1887,23 @@ impl<'db> CallableBinding<'db> {
                     overload.match_parameters(db, expanded_arguments, &mut argument_forms);
                 }
 
+                tracing::trace!(
+                    target: "ty_python_semantic::types::call::bind",
+                    matching_overload_index = ?self.matching_overload_index(),
+                    "after step 1",
+                );
+
                 merged_argument_forms.merge(&argument_forms);
 
                 for (_, overload) in self.matching_overloads_mut() {
                     overload.check_types(db, expanded_arguments, call_expression_tcx);
                 }
+
+                tracing::trace!(
+                    target: "ty_python_semantic::types::call::bind",
+                    matching_overload_index = ?self.matching_overload_index(),
+                    "after step 2",
+                );
 
                 let return_type = match self.matching_overload_index() {
                     MatchingOverloadIndex::None => None,
@@ -1706,6 +1912,12 @@ impl<'db> CallableBinding<'db> {
                     }
                     MatchingOverloadIndex::Multiple(matching_overload_indexes) => {
                         self.filter_overloads_containing_variadic(&matching_overload_indexes);
+
+                        tracing::trace!(
+                            target: "ty_python_semantic::types::call::bind",
+                            matching_overload_index = ?self.matching_overload_index(),
+                            "after step 4",
+                        );
 
                         match self.matching_overload_index() {
                             MatchingOverloadIndex::None => {
@@ -1721,6 +1933,13 @@ impl<'db> CallableBinding<'db> {
                                     expanded_arguments,
                                     &indexes,
                                 );
+
+                                tracing::trace!(
+                                    target: "ty_python_semantic::types::call::bind",
+                                    matching_overload_index = ?self.matching_overload_index(),
+                                    "after step 5",
+                                );
+
                                 Some(self.return_type())
                             }
                         }
@@ -1849,9 +2068,8 @@ impl<'db> CallableBinding<'db> {
                 for &parameter_index in &overload.argument_matches[argument_index].parameters {
                     // TODO: For an unannotated `self` / `cls` parameter, the type should be
                     // `typing.Self` / `type[typing.Self]`
-                    let current_parameter_type = overload.signature.parameters()[parameter_index]
-                        .annotated_type()
-                        .unwrap_or(Type::unknown());
+                    let current_parameter_type =
+                        overload.signature.parameters()[parameter_index].annotated_type();
                     let first_parameter_type = &mut first_parameter_types[parameter_index];
                     if let Some(first_parameter_type) = first_parameter_type {
                         if !first_parameter_type
@@ -1875,12 +2093,37 @@ impl<'db> CallableBinding<'db> {
             .take(max_parameter_count)
             .collect::<Vec<_>>();
 
+        // The following loop is trying to construct a tuple of argument types that correspond to
+        // the participating parameter indexes. Considering the following example:
+        //
+        // ```python
+        // @overload
+        // def f(x: Literal[1], y: Literal[2]) -> tuple[int, int]: ...
+        // @overload
+        // def f(*args: Any) -> tuple[Any, ...]: ...
+        //
+        // f(1, 2)
+        // ```
+        //
+        // Here, only the first parameter participates in the filtering process because only one
+        // overload has the second parameter. So, while going through the argument types, the
+        // second argument needs to be skipped but for the second overload both arguments map to
+        // the first parameter and that parameter is considered for the filtering process. This
+        // flag is to handle that special case of many-to-one mapping from arguments to parameters.
+        let mut variadic_parameter_handled = false;
+
         for (argument_index, argument_type) in arguments.iter_types().enumerate() {
+            if variadic_parameter_handled {
+                continue;
+            }
             for overload_index in matching_overload_indexes {
                 let overload = &self.overloads[*overload_index];
                 for (parameter_index, variadic_argument_type) in
                     overload.argument_matches[argument_index].iter()
                 {
+                    if overload.signature.parameters()[parameter_index].is_variadic() {
+                        variadic_parameter_handled = true;
+                    }
                     if !participating_parameter_indexes.contains(&parameter_index) {
                         continue;
                     }
@@ -1937,9 +2180,8 @@ impl<'db> CallableBinding<'db> {
                         }
                         // TODO: For an unannotated `self` / `cls` parameter, the type should be
                         // `typing.Self` / `type[typing.Self]`
-                        let mut parameter_type = overload.signature.parameters()[*parameter_index]
-                            .annotated_type()
-                            .unwrap_or(Type::unknown());
+                        let mut parameter_type =
+                            overload.signature.parameters()[*parameter_index].annotated_type();
                         if let Some(specialization) = overload.specialization {
                             parameter_type =
                                 parameter_type.apply_specialization(db, specialization);
@@ -2017,10 +2259,32 @@ impl<'db> CallableBinding<'db> {
         !self.overloads.is_empty()
     }
 
-    /// Returns whether there were any errors binding this call site. If the callable has multiple
-    /// overloads, they must _all_ have errors.
-    pub(crate) fn has_binding_errors(&self) -> bool {
-        self.matching_overloads().next().is_none()
+    /// Returns whether there were any errors binding this call site.
+    ///
+    /// This is true if either:
+    /// - No overloads matched (all had type/arity errors).
+    /// - A matching overload has errors (including semantic errors that don't affect
+    ///   overload resolution, like applying `@dataclass` to a `NamedTuple`).
+    fn has_binding_errors(&self) -> bool {
+        let mut matching_overloads = self.matching_overloads();
+
+        // If there are no matching overloads, we have binding errors.
+        let Some((_, first_overload)) = matching_overloads.next() else {
+            return true;
+        };
+
+        // If any matching overload has semantic errors (that don't affect overload
+        // resolution), we have binding errors.
+        if !first_overload.errors.is_empty() {
+            return true;
+        }
+        for (_, overload) in matching_overloads {
+            if !overload.errors.is_empty() {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Returns the index of the matching overload in the form of [`MatchingOverloadIndex`].
@@ -2054,7 +2318,7 @@ impl<'db> CallableBinding<'db> {
         self.overloads
             .iter()
             .enumerate()
-            .filter(|(_, overload)| overload.as_result().is_ok())
+            .filter(|(_, overload)| !overload.has_errors_affecting_overload_resolution())
     }
 
     /// Returns an iterator over all the mutable overloads that matched for this call binding.
@@ -2064,7 +2328,7 @@ impl<'db> CallableBinding<'db> {
         self.overloads
             .iter_mut()
             .enumerate()
-            .filter(|(_, overload)| overload.as_result().is_ok())
+            .filter(|(_, overload)| !overload.has_errors_affecting_overload_resolution())
     }
 
     /// Returns the return type of this call.
@@ -2158,9 +2422,33 @@ impl<'db> CallableBinding<'db> {
                     _ => None,
                 };
 
-                // If there is a single matching overload, the diagnostics should be reported
-                // directly for that overload.
+                // If only one overload passed arity check, report its errors directly.
                 if let Some(matching_overload_index) = self.matching_overload_before_type_checking {
+                    let callable_description =
+                        CallableDescription::new(context.db(), self.signature_type);
+                    let matching_overload =
+                        function_type_and_kind.map(|(kind, function)| MatchingOverloadLiteral {
+                            index: matching_overload_index,
+                            kind,
+                            function,
+                        });
+                    self.overloads[matching_overload_index].report_diagnostics(
+                        context,
+                        node,
+                        self.signature_type,
+                        callable_description.as_ref(),
+                        union_diag,
+                        matching_overload.as_ref(),
+                    );
+                    return;
+                }
+
+                // If multiple overloads passed arity check but only one matched types
+                // (possibly with semantic errors), report its errors directly instead
+                // of the generic "no matching overload" message.
+                if let MatchingOverloadIndex::Single(matching_overload_index) =
+                    self.matching_overload_index()
+                {
                     let callable_description =
                         CallableDescription::new(context.db(), self.signature_type);
                     let matching_overload =
@@ -2530,26 +2818,63 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
     ) -> Result<(), ()> {
-        // TODO: `Type::iterate` internally handles unions, but in a lossy way.
-        // It might be superior here to manually map over the union and call `try_iterate`
-        // on each element, similar to the way that `unpacker.rs` does in the `unpack_inner` method.
-        // It might be a bit of a refactor, though.
-        // See <https://github.com/astral-sh/ruff/pull/20377#issuecomment-3401380305>
-        // for more details. --Alex
-        let tuple = argument_type.map(|ty| ty.iterate(db));
-        let (mut argument_types, length, variable_element) = match tuple.as_ref() {
-            Some(tuple) => (
-                Either::Left(tuple.all_elements().copied()),
+        enum VariadicArgumentType<'db> {
+            ParamSpec(Type<'db>),
+            Other(Cow<'db, TupleSpec<'db>>),
+            None,
+        }
+
+        let variadic_type = match argument_type {
+            Some(argument_type @ Type::Union(union)) => {
+                // When accessing an instance attribute that is a `P.args`, the type we infer is
+                // `Unknown | P.args`. This needs to be special cased here to avoid calling
+                // `iterate` on it which will lose the `ParamSpec` information as it will return
+                // `object` that comes from the upper bound of `P.args`. What we want is to always
+                // use the `P.args` type to perform type checking against the parameter type. This
+                // will allow us to error when `*args: P.args` is matched against, for example,
+                // `n: int` and correctly type check when `*args: P.args` is matched against
+                // `*args: P.args` (another ParamSpec).
+                match union.elements(db) {
+                    [paramspec @ Type::TypeVar(typevar), other]
+                    | [other, paramspec @ Type::TypeVar(typevar)]
+                        if typevar.is_paramspec(db) && other.is_unknown() =>
+                    {
+                        VariadicArgumentType::ParamSpec(*paramspec)
+                    }
+                    _ => {
+                        // TODO: Same todo comment as in the non-paramspec case below
+                        VariadicArgumentType::Other(argument_type.iterate(db))
+                    }
+                }
+            }
+            Some(paramspec @ Type::TypeVar(typevar)) if typevar.is_paramspec(db) => {
+                VariadicArgumentType::ParamSpec(paramspec)
+            }
+            Some(argument_type) => {
+                // TODO: `Type::iterate` internally handles unions, but in a lossy way.
+                // It might be superior here to manually map over the union and call `try_iterate`
+                // on each element, similar to the way that `unpacker.rs` does in the `unpack_inner` method.
+                // It might be a bit of a refactor, though.
+                // See <https://github.com/astral-sh/ruff/pull/20377#issuecomment-3401380305>
+                // for more details. --Alex
+                VariadicArgumentType::Other(argument_type.iterate(db))
+            }
+            None => VariadicArgumentType::None,
+        };
+
+        let (argument_types, length, variable_element) = match &variadic_type {
+            VariadicArgumentType::ParamSpec(paramspec) => {
+                ([].as_slice(), TupleLength::unknown(), Some(*paramspec))
+            }
+            VariadicArgumentType::Other(tuple) => (
+                tuple.all_elements(),
                 tuple.len(),
                 tuple.variable_element().copied(),
             ),
-            None => (
-                Either::Right(std::iter::empty()),
-                TupleLength::unknown(),
-                None,
-            ),
+            VariadicArgumentType::None => ([].as_slice(), TupleLength::unknown(), None),
         };
 
+        let mut argument_types = argument_types.iter().copied();
         let is_variable = length.is_variable();
 
         // We must be able to match up the fixed-length portion of the argument with positional
@@ -2618,19 +2943,41 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 );
             }
         } else {
-            let value_type = match argument_type.map(|ty| {
-                ty.member_lookup_with_policy(
+            let dunder_getitem_return_type = |ty: Type<'db>| match ty
+                .member_lookup_with_policy(
                     db,
                     Name::new_static("__getitem__"),
                     MemberLookupPolicy::NO_INSTANCE_FALLBACK,
                 )
                 .place
-            }) {
-                Some(Place::Defined(keys_method, _, Definedness::AlwaysDefined)) => keys_method
+            {
+                Place::Defined(DefinedPlace {
+                    ty: getitem_method,
+                    definedness: Definedness::AlwaysDefined,
+                    ..
+                }) => getitem_method
                     .try_call(db, &CallArguments::positional([Type::unknown()]))
                     .ok()
                     .map_or_else(Type::unknown, |bindings| bindings.return_type(db)),
                 _ => Type::unknown(),
+            };
+
+            let value_type = match argument_type {
+                Some(argument_type @ Type::Union(union)) => {
+                    // See the comment in `match_variadic` for why we special case this situation.
+                    match union.elements(db) {
+                        [paramspec @ Type::TypeVar(typevar), other]
+                        | [other, paramspec @ Type::TypeVar(typevar)]
+                            if typevar.is_paramspec(db) && other.is_unknown() =>
+                        {
+                            *paramspec
+                        }
+                        _ => dunder_getitem_return_type(argument_type),
+                    }
+                }
+                Some(paramspec @ Type::TypeVar(typevar)) if typevar.is_paramspec(db) => paramspec,
+                Some(argument_type) => dunder_getitem_return_type(argument_type),
+                None => Type::unknown(),
             };
 
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
@@ -2702,6 +3049,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
 
 struct ArgumentTypeChecker<'a, 'db> {
     db: &'db dyn Db,
+    signature_type: Type<'db>,
     signature: &'a Signature<'db>,
     arguments: &'a CallArguments<'a, 'db>,
     argument_matches: &'a [MatchedArgument<'db>],
@@ -2719,6 +3067,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     #[expect(clippy::too_many_arguments)]
     fn new(
         db: &'db dyn Db,
+        signature_type: Type<'db>,
         signature: &'a Signature<'db>,
         arguments: &'a CallArguments<'a, 'db>,
         argument_matches: &'a [MatchedArgument<'db>],
@@ -2730,6 +3079,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     ) -> Self {
         Self {
             db,
+            signature_type,
             signature,
             arguments,
             argument_matches,
@@ -2777,7 +3127,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
         let return_with_tcx = self
             .constructor_instance_type
-            .or(self.signature.return_ty)
+            .or(Some(self.signature.return_ty))
             .zip(self.call_expression_tcx.annotation);
 
         self.inferable_typevars = generic_context.inferable_typevars(self.db);
@@ -2788,12 +3138,25 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             tcx.filter_union(self.db, |ty| ty.class_specialization(self.db).is_some())
                 .class_specialization(self.db)?;
 
-            builder.infer(return_ty, tcx).ok()?;
+            builder
+                .infer_reverse_map(tcx, return_ty, |(_, variance, inferred_ty)| {
+                    // Avoid unnecessarily widening the return type based on a covariant
+                    // type parameter from the type context, as it can lead to argument
+                    // assignability errors if the type variable is constrained by a narrower
+                    // parameter type.
+                    if variance.is_covariant() {
+                        return None;
+                    }
+
+                    Some(inferred_ty)
+                })
+                .ok()?;
+
             Some(builder.type_mappings().clone())
         });
 
-        // For a given type variable, we track the variance of any assignments to that type variable
-        // in the argument types.
+        // For a given type variable, we keep track of the variance of any assignments to
+        // that type variable in the type context.
         let mut variance_in_arguments: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
             FxHashMap::default();
 
@@ -2804,13 +3167,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             for (parameter_index, variadic_argument_type) in
                 self.argument_matches[argument_index].iter()
             {
-                let parameter = &parameters[parameter_index];
-                let Some(expected_type) = parameter.annotated_type() else {
-                    continue;
-                };
-
                 let specialization_result = builder.infer_map(
-                    expected_type,
+                    parameters[parameter_index].annotated_type(),
                     variadic_argument_type.unwrap_or(argument_type),
                     |(identity, variance, inferred_ty)| {
                         // Avoid widening the inferred type if it is already assignable to the
@@ -2845,10 +3203,9 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
         // Attempt to promote any literal types assigned to the specialization.
         let maybe_promote = |identity, typevar, ty: Type<'db>| {
-            let Some(return_ty) = self.constructor_instance_type.or(self.signature.return_ty)
-            else {
-                return ty;
-            };
+            let return_ty = self
+                .constructor_instance_type
+                .unwrap_or(self.signature.return_ty);
 
             let mut combined_tcx = TypeContext::default();
             let mut variance_in_return = TypeVarVariance::Bivariant;
@@ -2880,7 +3237,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 return ty;
             }
 
-            // If the type variable is a non-covariant position in the argument, then we avoid
+            // If the type variable is a non-covariant position in any argument, then we avoid
             // promotion, respecting any literals in the parameter type.
             if variance_in_arguments
                 .get(&identity)
@@ -2941,30 +3298,33 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     ) {
         let parameters = self.signature.parameters();
         let parameter = &parameters[parameter_index];
-        if let Some(mut expected_ty) = parameter.annotated_type() {
-            if let Some(specialization) = self.specialization {
-                argument_type = argument_type.apply_specialization(self.db, specialization);
-                expected_ty = expected_ty.apply_specialization(self.db, specialization);
-            }
-            // This is one of the few places where we want to check if there's _any_ specialization
-            // where assignability holds; normally we want to check that assignability holds for
-            // _all_ specializations.
-            // TODO: Soon we will go further, and build the actual specializations from the
-            // constraint set that we get from this assignability check, instead of inferring and
-            // building them in an earlier separate step.
-            if argument_type
+        let mut expected_ty = parameter.annotated_type();
+        if let Some(specialization) = self.specialization {
+            argument_type = argument_type.apply_specialization(self.db, specialization);
+            expected_ty = expected_ty.apply_specialization(self.db, specialization);
+        }
+        // This is one of the few places where we want to check if there's _any_ specialization
+        // where assignability holds; normally we want to check that assignability holds for
+        // _all_ specializations.
+        //
+        // TODO: Soon we will go further, and build the actual specializations from the
+        // constraint set that we get from this assignability check, instead of inferring and
+        // building them in an earlier separate step.
+        //
+        // TODO: handle starred annotations, e.g. `*args: *Ts` or `*args: *tuple[int, *tuple[str, ...]]`
+        if !parameter.has_starred_annotation()
+            && argument_type
                 .when_assignable_to(self.db, expected_ty, self.inferable_typevars)
                 .is_never_satisfied(self.db)
-            {
-                let positional = matches!(argument, Argument::Positional | Argument::Synthetic)
-                    && !parameter.is_variadic();
-                self.errors.push(BindingError::InvalidArgumentType {
-                    parameter: ParameterContext::new(parameter, parameter_index, positional),
-                    argument_index: adjusted_argument_index,
-                    expected_ty,
-                    provided_ty: argument_type,
-                });
-            }
+        {
+            let positional = matches!(argument, Argument::Positional | Argument::Synthetic)
+                && !parameter.is_variadic();
+            self.errors.push(BindingError::InvalidArgumentType {
+                parameter: ParameterContext::new(parameter, parameter_index, positional),
+                argument_index: adjusted_argument_index,
+                expected_ty,
+                provided_ty: argument_type,
+            });
         }
         // We still update the actual type of the parameter in this binding to match the
         // argument, even if the argument type is not assignable to the expected parameter
@@ -2978,9 +3338,23 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     }
 
     fn check_argument_types(&mut self) {
+        let paramspec = self
+            .signature
+            .parameters()
+            .find_paramspec_from_args_kwargs(self.db);
+
         for (argument_index, adjusted_argument_index, argument, argument_type) in
             self.enumerate_argument_types()
         {
+            if let Some((_, paramspec)) = paramspec {
+                if self.try_paramspec_evaluation_at(argument_index, paramspec) {
+                    // Once we find an argument that matches the `ParamSpec`, we can stop checking
+                    // the remaining arguments since `ParamSpec` should always be the last
+                    // parameter.
+                    return;
+                }
+            }
+
             match argument {
                 Argument::Variadic => self.check_variadic_argument_type(
                     argument_index,
@@ -3006,6 +3380,171 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 }
             }
         }
+
+        if let Some((_, paramspec)) = paramspec {
+            // If we reach here, none of the arguments matched the `ParamSpec` parameter, but the
+            // `ParamSpec` could specialize to a parameter list containing some parameters. For
+            // example,
+            //
+            // ```py
+            // from typing import Callable
+            //
+            // def foo[**P](f: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None: ...
+            //
+            // def f(x: int) -> None: ...
+            //
+            // foo(f)
+            // ```
+            //
+            // Here, no arguments match the `ParamSpec` parameter, but `P` specializes to `(x: int)`,
+            // so we need to perform a sub-call with no arguments.
+            self.evaluate_paramspec_sub_call(None, paramspec);
+        }
+    }
+
+    /// Try to evaluate a `ParamSpec` sub-call at the given argument index.
+    ///
+    /// The `ParamSpec` parameter is always going to be at the end of the parameter list but there
+    /// can be other parameter before it. If one of these prepended positional parameters contains
+    /// a free `ParamSpec`, we consider that variable in scope for the purposes of extracting the
+    /// components of that `ParamSpec`. For example:
+    ///
+    /// ```py
+    /// from typing import Callable
+    ///
+    /// def foo[**P](f: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None: ...
+    ///
+    /// def f(x: int, y: str) -> None: ...
+    ///
+    /// foo(f, 1, "hello")  # P: (x: int, y: str)
+    /// ```
+    ///
+    /// Here, `P` specializes to `(x: int, y: str)` when `foo` is called with `f`, which means that
+    /// the parameters of `f` become a part of `foo`'s parameter list replacing the `ParamSpec`
+    /// parameter which is:
+    ///
+    /// ```py
+    /// def foo(f: Callable[[x: int, y: str], None], x: int, y: str) -> None: ...
+    /// ```
+    ///
+    /// This method will check whether the parameter matching the argument at `argument_index` is
+    /// annotated with the components of `ParamSpec`, and if so, will invoke a sub-call considering
+    /// the arguments starting from `argument_index` against the specialized parameter list.
+    ///
+    /// Returns `true` if the sub-call was invoked, `false` otherwise.
+    fn try_paramspec_evaluation_at(
+        &mut self,
+        argument_index: usize,
+        paramspec: BoundTypeVarInstance<'db>,
+    ) -> bool {
+        let [parameter_index] = self.argument_matches[argument_index].parameters.as_slice() else {
+            return false;
+        };
+
+        let Type::TypeVar(typevar) = self.signature.parameters()[*parameter_index].annotated_type()
+        else {
+            return false;
+        };
+        if !typevar.is_paramspec(self.db) {
+            return false;
+        }
+
+        self.evaluate_paramspec_sub_call(Some(argument_index), paramspec)
+    }
+
+    /// Invoke a sub-call for the given `ParamSpec` type variable, using the remaining arguments.
+    ///
+    /// The remaining arguments start from `argument_index` if provided, otherwise no arguments
+    /// are passed.
+    ///
+    /// This method returns `false` if the specialization does not contain a mapping for the given
+    /// `paramspec` or contains an invalid mapping (i.e., not a `Callable` of kind `ParamSpecValue`).
+    ///
+    /// For more details, refer to [`Self::try_paramspec_evaluation_at`].
+    fn evaluate_paramspec_sub_call(
+        &mut self,
+        argument_index: Option<usize>,
+        paramspec: BoundTypeVarInstance<'db>,
+    ) -> bool {
+        let Some(Type::Callable(callable)) = self
+            .specialization
+            .and_then(|specialization| specialization.get(self.db, paramspec))
+        else {
+            return false;
+        };
+
+        if callable.kind(self.db) != CallableTypeKind::ParamSpecValue {
+            return false;
+        }
+
+        let signatures = &callable.signatures(self.db).overloads;
+        if signatures.is_empty() {
+            return false;
+        }
+
+        let sub_arguments = if let Some(argument_index) = argument_index {
+            self.arguments.start_from(argument_index)
+        } else {
+            CallArguments::none()
+        };
+
+        // Create Bindings with all overloads and perform full overload resolution
+        let callable_binding =
+            CallableBinding::from_overloads(self.signature_type, signatures.iter().cloned());
+        let bindings = match Bindings::from(callable_binding)
+            .match_parameters(self.db, &sub_arguments)
+            .check_types(self.db, &sub_arguments, self.call_expression_tcx, &[])
+        {
+            Ok(bindings) => bindings,
+            Err(CallError(_, bindings)) => *bindings,
+        };
+
+        // SAFETY: `bindings` was created from a single `CallableBinding` above.
+        let callable_binding = bindings
+            .single_element()
+            .expect("ParamSpec sub-call should only contain a single CallableBinding");
+
+        match callable_binding.matching_overload_index() {
+            MatchingOverloadIndex::None => {
+                if let [binding] = callable_binding.overloads() {
+                    // This is not an overloaded function, so we can propagate its errors to the
+                    // outer bindings.
+                    self.errors.extend(binding.errors.iter().cloned());
+                } else {
+                    let index = callable_binding
+                        .matching_overload_before_type_checking
+                        .unwrap_or(0);
+                    // TODO: We should also update the specialization for the `ParamSpec` to reflect
+                    // the matching overload here.
+                    self.errors
+                        .extend(callable_binding.overloads()[index].errors.iter().cloned());
+                }
+            }
+            MatchingOverloadIndex::Single(index) => {
+                // TODO: We should also update the specialization for the `ParamSpec` to reflect the
+                // matching overload here.
+                self.errors
+                    .extend(callable_binding.overloads()[index].errors.iter().cloned());
+            }
+            MatchingOverloadIndex::Multiple(_) => {
+                if !matches!(
+                    callable_binding.overload_call_return_type,
+                    Some(OverloadCallReturnType::ArgumentTypeExpansion(_))
+                ) {
+                    self.errors.extend(
+                        callable_binding
+                            .overloads()
+                            .first()
+                            .unwrap()
+                            .errors
+                            .iter()
+                            .cloned(),
+                    );
+                }
+            }
+        }
+
+        true
     }
 
     fn check_variadic_argument_type(
@@ -3048,67 +3587,100 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 );
             }
         } else {
-            // TODO: Instead of calling the `keys` and `__getitem__` methods, we should instead
-            // get the constraints which satisfies the `SupportsKeysAndGetItem` protocol i.e., the
-            // key and value type.
-            let key_type = match argument_type
-                .member_lookup_with_policy(
-                    self.db,
-                    Name::new_static("keys"),
-                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
-                )
-                .place
-            {
-                Place::Defined(keys_method, _, Definedness::AlwaysDefined) => keys_method
-                    .try_call(self.db, &CallArguments::none())
-                    .ok()
-                    .and_then(|bindings| {
-                        Some(
-                            bindings
-                                .return_type(self.db)
-                                .try_iterate(self.db)
-                                .ok()?
-                                .homogeneous_element_type(self.db),
+            let mut value_type_fallback = |argument_type: Type<'db>| {
+                // TODO: Instead of calling the `keys` and `__getitem__` methods, we should
+                // instead get the constraints which satisfies the `SupportsKeysAndGetItem`
+                // protocol i.e., the key and value type.
+                let key_type = match argument_type
+                    .member_lookup_with_policy(
+                        self.db,
+                        Name::new_static("keys"),
+                        MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    )
+                    .place
+                {
+                    Place::Defined(DefinedPlace {
+                        ty: keys_method,
+                        definedness: Definedness::AlwaysDefined,
+                        ..
+                    }) => keys_method
+                        .try_call(self.db, &CallArguments::none())
+                        .ok()
+                        .and_then(|bindings| {
+                            Some(
+                                bindings
+                                    .return_type(self.db)
+                                    .try_iterate(self.db)
+                                    .ok()?
+                                    .homogeneous_element_type(self.db),
+                            )
+                        }),
+                    _ => None,
+                };
+
+                let Some(key_type) = key_type else {
+                    self.errors.push(BindingError::KeywordsNotAMapping {
+                        argument_index: adjusted_argument_index,
+                        provided_ty: argument_type,
+                    });
+                    return None;
+                };
+
+                if !key_type
+                    .when_assignable_to(
+                        self.db,
+                        KnownClass::Str.to_instance(self.db),
+                        self.inferable_typevars,
+                    )
+                    .is_always_satisfied(self.db)
+                {
+                    self.errors.push(BindingError::InvalidKeyType {
+                        argument_index: adjusted_argument_index,
+                        provided_ty: key_type,
+                    });
+                }
+
+                Some(
+                    match argument_type
+                        .member_lookup_with_policy(
+                            self.db,
+                            Name::new_static("__getitem__"),
+                            MemberLookupPolicy::NO_INSTANCE_FALLBACK,
                         )
-                    }),
-                _ => None,
+                        .place
+                    {
+                        Place::Defined(DefinedPlace {
+                            ty: getitem_method,
+                            definedness: Definedness::AlwaysDefined,
+                            ..
+                        }) => getitem_method
+                            .try_call(self.db, &CallArguments::positional([Type::unknown()]))
+                            .ok()
+                            .map_or_else(Type::unknown, |bindings| bindings.return_type(self.db)),
+                        _ => Type::unknown(),
+                    },
+                )
             };
 
-            let Some(key_type) = key_type else {
-                self.errors.push(BindingError::KeywordsNotAMapping {
-                    argument_index: adjusted_argument_index,
-                    provided_ty: argument_type,
-                });
+            let value_type = match argument_type {
+                Type::Union(union) => {
+                    // See the comment in `match_variadic` for why we special case this situation.
+                    match union.elements(self.db) {
+                        [paramspec @ Type::TypeVar(typevar), other]
+                        | [other, paramspec @ Type::TypeVar(typevar)]
+                            if typevar.is_paramspec(self.db) && other.is_unknown() =>
+                        {
+                            Some(*paramspec)
+                        }
+                        _ => value_type_fallback(argument_type),
+                    }
+                }
+                Type::TypeVar(typevar) if typevar.is_paramspec(self.db) => Some(argument_type),
+                _ => value_type_fallback(argument_type),
+            };
+
+            let Some(value_type) = value_type else {
                 return;
-            };
-
-            if !key_type
-                .when_assignable_to(
-                    self.db,
-                    KnownClass::Str.to_instance(self.db),
-                    self.inferable_typevars,
-                )
-                .is_always_satisfied(self.db)
-            {
-                self.errors.push(BindingError::InvalidKeyType {
-                    argument_index: adjusted_argument_index,
-                    provided_ty: key_type,
-                });
-            }
-
-            let value_type = match argument_type
-                .member_lookup_with_policy(
-                    self.db,
-                    Name::new_static("__getitem__"),
-                    MemberLookupPolicy::NO_INSTANCE_FALLBACK,
-                )
-                .place
-            {
-                Place::Defined(keys_method, _, Definedness::AlwaysDefined) => keys_method
-                    .try_call(self.db, &CallArguments::positional([Type::unknown()]))
-                    .ok()
-                    .map_or_else(Type::unknown, |bindings| bindings.return_type(self.db)),
-                _ => Type::unknown(),
             };
 
             for (argument_type, parameter_index) in
@@ -3273,7 +3845,7 @@ impl<'db> Binding<'db> {
         for (keywords_index, keywords_type) in keywords_arguments {
             matcher.match_keyword_variadic(db, keywords_index, keywords_type);
         }
-        self.return_ty = self.signature.return_ty.unwrap_or(Type::unknown());
+        self.return_ty = self.signature.return_ty;
         self.parameter_tys = vec![None; parameters.len()].into_boxed_slice();
         self.variadic_argument_matched_to_variadic_parameter =
             matcher.variadic_argument_matched_to_variadic_parameter;
@@ -3288,6 +3860,7 @@ impl<'db> Binding<'db> {
     ) {
         let mut checker = ArgumentTypeChecker::new(
             db,
+            self.signature_type,
             &self.signature,
             arguments,
             &self.argument_matches,
@@ -3297,6 +3870,11 @@ impl<'db> Binding<'db> {
             self.return_ty,
             &mut self.errors,
         );
+        if self.signature.parameters().is_top() {
+            self.errors
+                .push(BindingError::CalledTopCallable(self.signature_type));
+            return;
+        }
 
         // If this overload is generic, first see if we can infer a specialization of the function
         // from the arguments that were passed in.
@@ -3393,11 +3971,10 @@ impl<'db> Binding<'db> {
         }
     }
 
-    fn as_result(&self) -> Result<(), CallErrorKind> {
-        if !self.errors.is_empty() {
-            return Err(CallErrorKind::BindingError);
-        }
-        Ok(())
+    fn has_errors_affecting_overload_resolution(&self) -> bool {
+        self.errors
+            .iter()
+            .any(BindingError::affects_overload_resolution)
     }
 
     fn snapshot(&self) -> BindingSnapshot<'db> {
@@ -3558,12 +4135,15 @@ impl CallableBindingSnapshotter {
 /// Describes a callable for the purposes of diagnostics.
 #[derive(Debug)]
 pub(crate) struct CallableDescription<'a> {
-    name: &'a str,
-    kind: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'a str,
 }
 
 impl<'db> CallableDescription<'db> {
-    fn new(db: &'db dyn Db, callable_type: Type<'db>) -> Option<CallableDescription<'db>> {
+    pub(crate) fn new(
+        db: &'db dyn Db,
+        callable_type: Type<'db>,
+    ) -> Option<CallableDescription<'db>> {
         match callable_type {
             Type::FunctionLiteral(function) => Some(CallableDescription {
                 kind: "function",
@@ -3712,9 +4292,74 @@ pub(crate) enum BindingError<'db> {
     /// This overload binding of the callable does not match the arguments.
     // TODO: We could expand this with an enum to specify why the overload is unmatched.
     UnmatchedOverload,
+    /// The callable type is a top materialization (e.g., `Top[Callable[..., object]]`), which
+    /// represents the infinite union of all callables. While such types *are* callable (they pass
+    /// `callable()`), any specific call should fail because we don't know the actual signature.
+    CalledTopCallable(Type<'db>),
+    /// The `@dataclass` decorator was applied to an invalid target.
+    InvalidDataclassApplication(InvalidDataclassTarget),
+}
+
+/// The target of an invalid `@dataclass` application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidDataclassTarget {
+    NamedTuple,
+    TypedDict,
+    Enum,
+    Protocol,
+}
+
+/// Returns the invalid dataclass target for a class literal, if any.
+fn invalid_dataclass_target<'db>(
+    db: &'db dyn Db,
+    class_literal: &ClassLiteral<'db>,
+) -> Option<InvalidDataclassTarget> {
+    if matches!(class_literal, ClassLiteral::DynamicNamedTuple(_))
+        || class_literal
+            .as_static()
+            .is_some_and(|class| class.has_named_tuple_class_in_mro(db))
+    {
+        Some(InvalidDataclassTarget::NamedTuple)
+    } else if class_literal.is_typed_dict(db) {
+        Some(InvalidDataclassTarget::TypedDict)
+    } else if is_enum_class(db, Type::from(*class_literal)) {
+        Some(InvalidDataclassTarget::Enum)
+    } else if class_literal.is_protocol(db) {
+        Some(InvalidDataclassTarget::Protocol)
+    } else {
+        None
+    }
 }
 
 impl<'db> BindingError<'db> {
+    /// Returns `true` if this error indicates the overload didn't match the call arguments.
+    ///
+    /// Returns `false` for semantic errors where the overload matched the types but the
+    /// usage is invalid for other reasons (e.g., applying `@dataclass` to a `NamedTuple`).
+    /// These semantic errors should be reported directly rather than causing "no matching
+    /// overload" errors.
+    fn affects_overload_resolution(&self) -> bool {
+        match self {
+            // Semantic errors: the overload matched, but the usage is invalid
+            Self::InvalidDataclassApplication(_)
+            | Self::PropertyHasNoSetter(_)
+            | Self::CalledTopCallable(_)
+            | Self::InternalCallError(_) => false,
+
+            // Matching errors: the overload doesn't apply to these arguments
+            Self::InvalidArgumentType { .. }
+            | Self::InvalidKeyType { .. }
+            | Self::KeywordsNotAMapping { .. }
+            | Self::MissingArguments { .. }
+            | Self::UnknownArgument { .. }
+            | Self::PositionalOnlyParameterAsKwarg { .. }
+            | Self::TooManyPositionalArguments { .. }
+            | Self::ParameterAlreadyAssigned { .. }
+            | Self::SpecializationError { .. }
+            | Self::UnmatchedOverload => true,
+        }
+    }
+
     fn report_diagnostic(
         &self,
         context: &InferContext<'db, '_>,
@@ -3772,25 +4417,13 @@ impl<'db> BindingError<'db> {
                     return;
                 };
 
-                // Re-infer the argument type of call expressions, ignoring the type context for more
-                // precise error messages.
-                let provided_ty = match Self::get_argument_node(node, *argument_index) {
-                    None => *provided_ty,
-
-                    // Ignore starred arguments, as those are difficult to re-infer.
-                    Some(
-                        ast::ArgOrKeyword::Arg(ast::Expr::Starred(_))
-                        | ast::ArgOrKeyword::Keyword(ast::Keyword { arg: None, .. }),
-                    ) => *provided_ty,
-
-                    Some(
-                        ast::ArgOrKeyword::Arg(value)
-                        | ast::ArgOrKeyword::Keyword(ast::Keyword { value, .. }),
-                    ) => infer_isolated_expression(context.db(), context.scope(), value),
-                };
-
-                let provided_ty_display = provided_ty.display(context.db());
-                let expected_ty_display = expected_ty.display(context.db());
+                let display_settings = DisplaySettings::from_possibly_ambiguous_types(
+                    context.db(),
+                    [provided_ty, expected_ty],
+                );
+                let provided_ty_display =
+                    provided_ty.display_with(context.db(), display_settings.clone());
+                let expected_ty_display = expected_ty.display_with(context.db(), display_settings);
 
                 let mut diag = builder.into_diagnostic(format_args!(
                     "Argument{} is incorrect",
@@ -4151,6 +4784,50 @@ impl<'db> BindingError<'db> {
             }
 
             Self::UnmatchedOverload => {}
+
+            Self::CalledTopCallable(callable_ty) => {
+                let node = Self::get_node(node, None);
+                if let Some(builder) = context.report_lint(&CALL_TOP_CALLABLE, node) {
+                    let callable_ty_display = callable_ty.display(context.db());
+                    let mut diag = builder.into_diagnostic(format_args!(
+                        "Object of type `{callable_ty_display}` is not safe to call; \
+                        its signature is not known"
+                    ));
+                    diag.info(
+                        "This type includes all possible callables, so it cannot safely be called \
+                        because there is no valid set of arguments for it",
+                    );
+                    if let Some(union_diag) = union_diag {
+                        union_diag.add_union_context(context.db(), &mut diag);
+                    }
+                }
+            }
+
+            Self::InvalidDataclassApplication(target) => {
+                let node = Self::get_node(node, None);
+                if let Some(builder) = context.report_lint(&INVALID_DATACLASS, node) {
+                    let (message, info) = match target {
+                        InvalidDataclassTarget::NamedTuple => (
+                            "Cannot use `dataclass()` on a `NamedTuple` class",
+                            "An exception will be raised when instantiating the class at runtime",
+                        ),
+                        InvalidDataclassTarget::TypedDict => (
+                            "Cannot use `dataclass()` on a `TypedDict` class",
+                            "An exception will often be raised when instantiating the class at runtime",
+                        ),
+                        InvalidDataclassTarget::Enum => (
+                            "Cannot use `dataclass()` on an enum class",
+                            "Applying `@dataclass` to an enum is not supported at runtime",
+                        ),
+                        InvalidDataclassTarget::Protocol => (
+                            "Cannot use `dataclass()` on a protocol class",
+                            "Protocols define abstract interfaces and cannot be instantiated",
+                        ),
+                    };
+                    let mut diag = builder.into_diagnostic(message);
+                    diag.info(info);
+                }
+            }
         }
     }
 
@@ -4268,3 +4945,46 @@ impl fmt::Display for FunctionKind {
 // An example of a routine with many many overloads:
 // https://github.com/henribru/google-api-python-client-stubs/blob/master/googleapiclient-stubs/discovery.pyi
 const MAXIMUM_OVERLOADS: usize = 50;
+
+/// Infer the return type for a call to `asynccontextmanager`.
+///
+/// The `@asynccontextmanager` decorator transforms a function that returns (a subtype of) `AsyncIterator[T]`
+/// into a function that returns `_AsyncGeneratorContextManager[T]`.
+///
+/// TODO: This function only handles the most basic case. It should be removed once we have
+/// full support for generic protocols in the solver.
+fn asynccontextmanager_return_type<'db>(db: &'db dyn Db, func_ty: Type<'db>) -> Option<Type<'db>> {
+    let bindings = func_ty.bindings(db);
+    let binding = bindings
+        .single_element()?
+        .overloads
+        .iter()
+        .exactly_one()
+        .ok()?;
+    let signature = &binding.signature;
+
+    let yield_ty = signature
+        .return_ty
+        .try_iterate_with_mode(db, EvaluationMode::Async)
+        .ok()?
+        .homogeneous_element_type(db);
+
+    let context_manager =
+        known_module_symbol(db, KnownModule::Contextlib, "_AsyncGeneratorContextManager")
+            .place
+            .ignore_possibly_undefined()?
+            .as_class_literal()?;
+
+    let context_manager = context_manager.apply_specialization(db, |generic_context| {
+        generic_context.specialize_partial(db, [Some(yield_ty), None])
+    });
+
+    let new_return_ty = Type::from(context_manager).to_instance(db)?;
+    let new_signature = Signature::new(signature.parameters().clone(), new_return_ty);
+
+    Some(Type::Callable(CallableType::new(
+        db,
+        CallableSignature::single(new_signature),
+        CallableTypeKind::FunctionLike,
+    )))
+}

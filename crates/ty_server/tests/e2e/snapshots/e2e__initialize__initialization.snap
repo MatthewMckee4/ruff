@@ -43,6 +43,14 @@ expression: initialization_result
     "documentHighlightProvider": true,
     "documentSymbolProvider": true,
     "workspaceSymbolProvider": true,
+    "codeActionProvider": {
+      "codeActionKinds": [
+        "quickfix"
+      ]
+    },
+    "renameProvider": {
+      "prepareProvider": true
+    },
     "declarationProvider": true,
     "executeCommandProvider": {
       "commands": [
@@ -72,7 +80,8 @@ expression: initialization_result
         "tokenModifiers": [
           "definition",
           "readonly",
-          "async"
+          "async",
+          "documentation"
         ]
       },
       "range": true,

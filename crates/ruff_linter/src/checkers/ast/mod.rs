@@ -21,7 +21,7 @@
 //! represents the lint-rule analysis phase. In the future, these steps may be separated into
 //! distinct passes over the AST.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::path::Path;
 
 use itertools::Itertools;
@@ -35,6 +35,7 @@ use ruff_python_ast::helpers::{collect_import_from_member, is_docstring_stmt, to
 use ruff_python_ast::identifier::Identifier;
 use ruff_python_ast::name::QualifiedName;
 use ruff_python_ast::str::Quote;
+use ruff_python_ast::token::Tokens;
 use ruff_python_ast::visitor::{Visitor, walk_except_handler, walk_pattern};
 use ruff_python_ast::{
     self as ast, AnyParameterRef, ArgOrKeyword, Comprehension, ElifElseClause, ExceptHandler, Expr,
@@ -48,7 +49,7 @@ use ruff_python_parser::semantic_errors::{
     SemanticSyntaxChecker, SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
 };
 use ruff_python_parser::typing::{AnnotationKind, ParsedAnnotation, parse_type_annotation};
-use ruff_python_parser::{ParseError, Parsed, Tokens};
+use ruff_python_parser::{ParseError, Parsed};
 use ruff_python_semantic::all::{DunderAllDefinition, DunderAllFlags};
 use ruff_python_semantic::analyze::{imports, typing};
 use ruff_python_semantic::{
@@ -68,6 +69,7 @@ use crate::noqa::NoqaMapping;
 use crate::package::PackageRoot;
 use crate::preview::is_undefined_export_in_dunder_init_enabled;
 use crate::registry::Rule;
+use crate::rules::flake8_bugbear::rules::ReturnInGenerator;
 use crate::rules::pyflakes::rules::{
     LateFutureImport, MultipleStarredExpressions, ReturnOutsideFunction,
     UndefinedLocalWithNestedImportStarUsage, YieldOutsideFunction,
@@ -196,6 +198,8 @@ pub(crate) struct Checker<'a> {
     parsed_type_annotation: Option<&'a ParsedAnnotation>,
     /// The [`Path`] to the file under analysis.
     path: &'a Path,
+    /// Whether `path` points to an `__init__.py` file.
+    in_init_module: OnceCell<bool>,
     /// The [`Path`] to the package containing the current file.
     package: Option<PackageRoot<'a>>,
     /// The module representation of the current file (e.g., `foo.bar`).
@@ -272,6 +276,7 @@ impl<'a> Checker<'a> {
             noqa_line_for,
             noqa,
             path,
+            in_init_module: OnceCell::new(),
             package,
             module,
             source_type,
@@ -435,6 +440,15 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Returns the [`Tokens`] for the parsed source file.
+    ///
+    ///
+    /// Unlike [`Self::tokens`], this method always returns
+    /// the tokens for the current file, even when within a parsed type annotation.
+    pub(crate) fn source_tokens(&self) -> &'a Tokens {
+        self.parsed.tokens()
+    }
+
     /// The [`Locator`] for the current file, which enables extraction of source code from byte
     /// offsets.
     pub(crate) const fn locator(&self) -> &'a Locator<'a> {
@@ -471,9 +485,11 @@ impl<'a> Checker<'a> {
         self.context.settings
     }
 
-    /// The [`Path`] to the file under analysis.
-    pub(crate) const fn path(&self) -> &'a Path {
-        self.path
+    /// Returns whether the file under analysis is an `__init__.py` file.
+    pub(crate) fn in_init_module(&self) -> bool {
+        *self
+            .in_init_module
+            .get_or_init(|| self.path.ends_with("__init__.py"))
     }
 
     /// The [`Path`] to the package containing the current file.
@@ -728,6 +744,12 @@ impl SemanticSyntaxContext for Checker<'_> {
                     self.report_diagnostic(NonlocalWithoutBinding { name }, error.range);
                 }
             }
+            SemanticSyntaxErrorKind::ReturnInGenerator => {
+                // B901
+                if self.is_rule_enabled(Rule::ReturnInGenerator) {
+                    self.report_diagnostic(ReturnInGenerator, error.range);
+                }
+            }
             SemanticSyntaxErrorKind::ReboundComprehensionVariable
             | SemanticSyntaxErrorKind::DuplicateTypeParameter
             | SemanticSyntaxErrorKind::MultipleCaseAssignment(_)
@@ -746,6 +768,7 @@ impl SemanticSyntaxContext for Checker<'_> {
             | SemanticSyntaxErrorKind::LoadBeforeNonlocalDeclaration { .. }
             | SemanticSyntaxErrorKind::NonlocalAndGlobal(_)
             | SemanticSyntaxErrorKind::AnnotatedGlobal(_)
+            | SemanticSyntaxErrorKind::TypeParameterDefaultOrder(_)
             | SemanticSyntaxErrorKind::AnnotatedNonlocal(_) => {
                 self.semantic_errors.borrow_mut().push(error);
             }
@@ -779,6 +802,10 @@ impl SemanticSyntaxContext for Checker<'_> {
             match scope.kind {
                 ScopeKind::Class(_) => return false,
                 ScopeKind::Function(_) | ScopeKind::Lambda(_) => return true,
+                ScopeKind::Generator {
+                    kind: GeneratorKind::Generator,
+                    ..
+                } => return true,
                 ScopeKind::Generator { .. }
                 | ScopeKind::Module
                 | ScopeKind::Type
@@ -828,14 +855,19 @@ impl SemanticSyntaxContext for Checker<'_> {
         self.source_type.is_ipynb()
     }
 
-    fn in_generator_scope(&self) -> bool {
-        matches!(
-            &self.semantic.current_scope().kind,
-            ScopeKind::Generator {
-                kind: GeneratorKind::Generator,
-                ..
+    fn in_generator_context(&self) -> bool {
+        for scope in self.semantic.current_scopes() {
+            if matches!(
+                scope.kind,
+                ScopeKind::Generator {
+                    kind: GeneratorKind::Generator,
+                    ..
+                }
+            ) {
+                return true;
             }
-        )
+        }
+        false
     }
 
     fn in_loop_context(&self) -> bool {
@@ -1846,6 +1878,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                                 } else {
                                     self.visit_non_type_definition(value);
                                 }
+                            } else {
+                                // Ex: typing.TypeVar(**kwargs)
+                                self.visit_non_type_definition(value);
                             }
                         }
                     }
@@ -3144,7 +3179,7 @@ impl<'a> Checker<'a> {
                         // F822
                         if self.is_rule_enabled(Rule::UndefinedExport) {
                             if is_undefined_export_in_dunder_init_enabled(self.settings())
-                                || !self.path.ends_with("__init__.py")
+                                || !self.in_init_module()
                             {
                                 self.report_diagnostic(
                                     pyflakes::rules::UndefinedExport {

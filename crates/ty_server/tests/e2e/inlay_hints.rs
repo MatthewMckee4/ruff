@@ -28,7 +28,7 @@ y = foo(1)
         .build()
         .wait_until_workspaces_are_initialized();
 
-    server.open_text_document(foo, &foo_content, 1);
+    server.open_text_document(foo, foo_content, 1);
     let _ = server.await_notification::<PublishDiagnostics>();
 
     let hints = server
@@ -47,10 +47,38 @@ y = foo(1)
             "value": ": "
           },
           {
-            "value": "int"
+            "value": "int",
+            "location": {
+              "uri": "file://<typeshed>/stdlib/builtins.pyi",
+              "range": {
+                "start": {
+                  "line": 347,
+                  "character": 6
+                },
+                "end": {
+                  "line": 347,
+                  "character": 9
+                }
+              }
+            }
           }
         ],
-        "kind": 1
+        "kind": 1,
+        "textEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 5,
+                "character": 1
+              },
+              "end": {
+                "line": 5,
+                "character": 1
+              }
+            },
+            "newText": ": int"
+          }
+        ]
       },
       {
         "position": {
@@ -78,7 +106,8 @@ y = foo(1)
             "value": "="
           }
         ],
-        "kind": 2
+        "kind": 2,
+        "textEdits": []
       }
     ]
     "#);
@@ -103,7 +132,7 @@ fn variable_inlay_hints_disabled() -> Result<()> {
         .build()
         .wait_until_workspaces_are_initialized();
 
-    server.open_text_document(foo, &foo_content, 1);
+    server.open_text_document(foo, foo_content, 1);
     let _ = server.await_notification::<PublishDiagnostics>();
 
     let hints = server

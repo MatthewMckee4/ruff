@@ -9,6 +9,11 @@ use crate::settings::LinterSettings;
 
 // Rule-specific behavior
 
+// https://github.com/astral-sh/ruff/pull/21382
+pub(crate) const fn is_custom_exception_checking_enabled(settings: &LinterSettings) -> bool {
+    settings.preview.is_enabled()
+}
+
 // https://github.com/astral-sh/ruff/pull/15541
 pub(crate) const fn is_suspicious_function_reference_enabled(settings: &LinterSettings) -> bool {
     settings.preview.is_enabled()
@@ -270,7 +275,34 @@ pub(crate) const fn is_extended_i18n_function_matching_enabled(settings: &Linter
     settings.preview.is_enabled()
 }
 
+// https://github.com/astral-sh/ruff/pull/21374
+pub(crate) const fn is_extended_snmp_api_path_detection_enabled(settings: &LinterSettings) -> bool {
+    settings.preview.is_enabled()
+}
+
 // https://github.com/astral-sh/ruff/pull/21395
 pub(crate) const fn is_enumerate_for_loop_int_index_enabled(settings: &LinterSettings) -> bool {
+    settings.preview.is_enabled()
+}
+
+// https://github.com/astral-sh/ruff/pull/21469
+pub(crate) const fn is_s310_resolve_string_literal_bindings_enabled(
+    settings: &LinterSettings,
+) -> bool {
+    settings.preview.is_enabled()
+}
+
+// https://github.com/astral-sh/ruff/pull/21623
+pub(crate) const fn is_range_suppressions_enabled(settings: &LinterSettings) -> bool {
+    settings.preview.is_enabled()
+}
+
+// https://github.com/astral-sh/ruff/pull/22057
+pub(crate) const fn is_ble001_exc_info_suppression_enabled(settings: &LinterSettings) -> bool {
+    settings.preview.is_enabled()
+}
+
+// https://github.com/astral-sh/ruff/pull/22419
+pub(crate) const fn is_py315_support_enabled(settings: &LinterSettings) -> bool {
     settings.preview.is_enabled()
 }

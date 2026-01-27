@@ -131,6 +131,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::GeneratorReturnFromIterMethod) {
                 flake8_pyi::rules::bad_generator_return_type(function_def, checker);
             }
+            if checker.is_rule_enabled(Rule::StopIterationReturn) {
+                pylint::rules::stop_iteration_return(checker, function_def);
+            }
             if checker.source_type.is_stub() {
                 if checker.is_rule_enabled(Rule::StrOrReprDefinedInStub) {
                     flake8_pyi::rules::str_or_repr_defined_in_stub(checker, stmt);
@@ -343,6 +346,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.is_rule_enabled(Rule::InvalidArgumentName) {
                 pep8_naming::rules::invalid_argument_name_function(checker, function_def);
+            }
+            if checker.is_rule_enabled(Rule::PropertyWithoutReturn) {
+                ruff::rules::property_without_return(checker, function_def);
             }
         }
         Stmt::Return(_) => {
@@ -950,9 +956,6 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::MisplacedBareRaise) {
                 pylint::rules::misplaced_bare_raise(checker, raise);
             }
-            if checker.is_rule_enabled(Rule::StopIterationReturn) {
-                pylint::rules::stop_iteration_return(checker, raise);
-            }
         }
         Stmt::AugAssign(aug_assign @ ast::StmtAugAssign { target, .. }) => {
             if checker.is_rule_enabled(Rule::GlobalStatement) {
@@ -962,6 +965,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.is_rule_enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_aug_assign(checker, aug_assign);
+            }
+            if checker.is_rule_enabled(Rule::DuplicateEntryInDunderAll) {
+                ruff::rules::duplicate_entry_in_dunder_all_aug_assign(checker, aug_assign);
             }
         }
         Stmt::If(
@@ -1431,6 +1437,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_assign(checker, assign);
             }
+            if checker.is_rule_enabled(Rule::DuplicateEntryInDunderAll) {
+                ruff::rules::duplicate_entry_in_dunder_all_assign(checker, assign);
+            }
             if checker.source_type.is_stub() {
                 if checker.any_rule_enabled(&[
                     Rule::UnprefixedTypeParam,
@@ -1521,6 +1530,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.is_rule_enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_ann_assign(checker, assign_stmt);
+            }
+            if checker.is_rule_enabled(Rule::DuplicateEntryInDunderAll) {
+                ruff::rules::duplicate_entry_in_dunder_all_ann_assign(checker, assign_stmt);
             }
             if checker.source_type.is_stub() {
                 if let Some(value) = value {
@@ -1626,5 +1638,8 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
         }
         _ => {}
+    }
+    if checker.is_rule_enabled(Rule::NonEmptyInitModule) {
+        ruff::rules::non_empty_init_module(checker, stmt);
     }
 }

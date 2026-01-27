@@ -262,15 +262,15 @@ def _(
     af: type[AmbiguousClass] | type[FalsyClass],
     flag: bool,
 ):
-    reveal_type(ta)  # revealed: type[TruthyClass] | type[AmbiguousClass]
+    reveal_type(ta)  # revealed: type[TruthyClass | AmbiguousClass]
     if ta:
         reveal_type(ta)  # revealed: type[TruthyClass] | (type[AmbiguousClass] & ~AlwaysFalsy)
 
-    reveal_type(af)  # revealed: type[AmbiguousClass] | type[FalsyClass]
+    reveal_type(af)  # revealed: type[AmbiguousClass | FalsyClass]
     if af:
         reveal_type(af)  # revealed: type[AmbiguousClass] & ~AlwaysFalsy
 
-    # error: [unsupported-bool-conversion] "Boolean conversion is unsupported for type `MetaDeferred`"
+    # error: [unsupported-bool-conversion] "Boolean conversion is not supported for type `MetaDeferred`"
     if d:
         # TODO: Should be `Unknown`
         reveal_type(d)  # revealed: type[DeferredClass] & ~AlwaysFalsy
@@ -346,4 +346,20 @@ def _(x: LiteralString):
         reveal_type(x)  # revealed: Literal[""]
     else:
         reveal_type(x)  # revealed: LiteralString & ~Literal[""]
+```
+
+## Narrowing with named expressions (walrus operator)
+
+When a truthiness check is used with a named expression, the target of the named expression should
+be narrowed.
+
+```py
+def get_value() -> str | None:
+    return "hello"
+
+def f():
+    if x := get_value():
+        reveal_type(x)  # revealed: str & ~AlwaysFalsy
+    else:
+        reveal_type(x)  # revealed: (str & ~AlwaysTruthy) | None
 ```

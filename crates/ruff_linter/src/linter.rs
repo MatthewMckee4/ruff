@@ -26,13 +26,15 @@ use crate::doc_lines::{doc_lines_from_ast, doc_lines_from_tokens};
 use crate::fix::{FixResult, fix_file};
 use crate::noqa::add_noqa;
 use crate::package::PackageRoot;
+use crate::preview::is_py315_support_enabled;
 use crate::registry::Rule;
 #[cfg(any(feature = "test-rules", test))]
 use crate::rules::ruff::rules::test_rules::{self, TEST_RULES, TestRule};
 use crate::settings::types::UnsafeFixes;
 use crate::settings::{LinterSettings, TargetVersion, flags};
 use crate::source_kind::SourceKind;
-use crate::{Locator, directives, fs};
+use crate::suppression::Suppressions;
+use crate::{Locator, directives, fs, warn_user_once};
 
 pub(crate) mod float;
 
@@ -128,6 +130,7 @@ pub fn check_path(
     source_type: PySourceType,
     parsed: &Parsed<ModModule>,
     target_version: TargetVersion,
+    suppressions: &Suppressions,
 ) -> Vec<Diagnostic> {
     // Aggregate all diagnostics.
     let mut context = LintContext::new(path, locator.contents(), settings);
@@ -339,6 +342,7 @@ pub fn check_path(
             &directives.noqa_line_for,
             parsed.has_valid_syntax(),
             settings,
+            suppressions,
         );
         if noqa.is_enabled() {
             for index in ignored.iter().rev() {
@@ -400,6 +404,10 @@ pub fn add_noqa_to_path(
         &indexer,
     );
 
+    // Parse range suppression comments
+    let suppressions =
+        Suppressions::from_tokens(settings, locator.contents(), parsed.tokens(), &indexer);
+
     // Generate diagnostics, ignoring any existing `noqa` directives.
     let diagnostics = check_path(
         path,
@@ -414,6 +422,7 @@ pub fn add_noqa_to_path(
         source_type,
         &parsed,
         target_version,
+        &suppressions,
     );
 
     // Add any missing `# noqa` pragmas.
@@ -427,6 +436,7 @@ pub fn add_noqa_to_path(
         &directives.noqa_line_for,
         stylist.line_ending(),
         reason,
+        &suppressions,
     )
 }
 
@@ -441,6 +451,14 @@ pub fn lint_only(
     source: ParseSource,
 ) -> LinterResult {
     let target_version = settings.resolve_target_version(path);
+
+    if matches!(target_version.linter_version(), PythonVersion::PY315)
+        && !is_py315_support_enabled(settings)
+    {
+        warn_user_once!(
+            "Support for Python 3.15 is under development and may be unstable. Enable `preview` to remove this warning."
+        );
+    }
 
     let parsed = source.into_parsed(source_kind, source_type, target_version.parser_version());
 
@@ -461,6 +479,10 @@ pub fn lint_only(
         &indexer,
     );
 
+    // Parse range suppression comments
+    let suppressions =
+        Suppressions::from_tokens(settings, locator.contents(), parsed.tokens(), &indexer);
+
     // Generate diagnostics.
     let diagnostics = check_path(
         path,
@@ -475,6 +497,7 @@ pub fn lint_only(
         source_type,
         &parsed,
         target_version,
+        &suppressions,
     );
 
     LinterResult {
@@ -543,6 +566,14 @@ pub fn lint_fix<'a>(
 
     let target_version = settings.resolve_target_version(path);
 
+    if matches!(target_version.linter_version(), PythonVersion::PY315)
+        && !is_py315_support_enabled(settings)
+    {
+        warn_user_once!(
+            "Support for Python 3.15 is under development and may be unstable. Enable `preview` to remove this warning."
+        );
+    }
+
     // Continuously fix until the source code stabilizes.
     loop {
         // Parse once.
@@ -566,6 +597,10 @@ pub fn lint_fix<'a>(
             &indexer,
         );
 
+        // Parse range suppression comments
+        let suppressions =
+            Suppressions::from_tokens(settings, locator.contents(), parsed.tokens(), &indexer);
+
         // Generate diagnostics.
         let diagnostics = check_path(
             path,
@@ -580,6 +615,7 @@ pub fn lint_fix<'a>(
             source_type,
             &parsed,
             target_version,
+            &suppressions,
         );
 
         if iterations == 0 {
@@ -769,6 +805,7 @@ mod tests {
     use crate::registry::Rule;
     use crate::settings::LinterSettings;
     use crate::source_kind::SourceKind;
+    use crate::suppression::Suppressions;
     use crate::test::{TestedNotebook, assert_notebook_path, test_contents, test_snippet};
     use crate::{Locator, assert_diagnostics, directives, settings};
 
@@ -944,6 +981,8 @@ mod tests {
             &locator,
             &indexer,
         );
+        let suppressions =
+            Suppressions::from_tokens(settings, locator.contents(), parsed.tokens(), &indexer);
         let mut diagnostics = check_path(
             path,
             None,
@@ -957,6 +996,7 @@ mod tests {
             source_type,
             &parsed,
             target_version,
+            &suppressions,
         );
         diagnostics.sort_by(Diagnostic::ruff_start_ordering);
         diagnostics
@@ -982,6 +1022,7 @@ mod tests {
     #[test_case(Path::new("write_to_debug.py"), PythonVersion::PY310)]
     #[test_case(Path::new("invalid_expression.py"), PythonVersion::PY312)]
     #[test_case(Path::new("global_parameter.py"), PythonVersion::PY310)]
+    #[test_case(Path::new("annotated_global.py"), PythonVersion::PY314)]
     fn test_semantic_errors(path: &Path, python_version: PythonVersion) -> Result<()> {
         let snapshot = format!(
             "semantic_syntax_error_{}_{}",
@@ -1043,6 +1084,7 @@ mod tests {
         Rule::YieldFromInAsyncFunction,
         Path::new("yield_from_in_async_function.py")
     )]
+    #[test_case(Rule::ReturnInGenerator, Path::new("return_in_generator.py"))]
     fn test_syntax_errors(rule: Rule, path: &Path) -> Result<()> {
         let snapshot = path.to_string_lossy().to_string();
         let path = Path::new("resources/test/fixtures/syntax_errors").join(path);

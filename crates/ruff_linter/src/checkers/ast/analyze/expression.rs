@@ -214,6 +214,13 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             range: _,
             node_index: _,
         }) => {
+            if checker.is_rule_enabled(Rule::ImplicitStringConcatenationInCollectionLiteral) {
+                flake8_implicit_str_concat::rules::implicit_string_concatenation_in_collection_literal(
+                    checker,
+                    expr,
+                    elts,
+                );
+            }
             if ctx.is_store() {
                 let check_too_many_expressions =
                     checker.is_rule_enabled(Rule::ExpressionsInStarAssignment);
@@ -1036,7 +1043,7 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             ]) && flake8_gettext::is_gettext_func_call(
                 checker,
                 func,
-                &checker.settings().flake8_gettext.functions_names,
+                &checker.settings().flake8_gettext.function_names,
             ) {
                 if checker.is_rule_enabled(Rule::FStringInGetTextFuncCall) {
                     flake8_gettext::rules::f_string_in_gettext_func_call(checker, args);
@@ -1238,6 +1245,9 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             if checker.is_rule_enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_extend_call(checker, call);
             }
+            if checker.is_rule_enabled(Rule::DuplicateEntryInDunderAll) {
+                ruff::rules::duplicate_entry_in_dunder_all_extend_call(checker, call);
+            }
             if checker.is_rule_enabled(Rule::DefaultFactoryKwarg) {
                 ruff::rules::default_factory_kwarg(checker, call);
             }
@@ -1270,6 +1280,9 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             }
             if checker.is_rule_enabled(Rule::Airflow3SuggestedUpdate) {
                 airflow::rules::airflow_3_0_suggested_update_expr(checker, expr);
+            }
+            if checker.is_rule_enabled(Rule::Airflow3IncompatibleFunctionSignature) {
+                airflow::rules::airflow_3_incompatible_function_signature(checker, expr);
             }
             if checker.is_rule_enabled(Rule::UnnecessaryCastToInt) {
                 ruff::rules::unnecessary_cast_to_int(checker, call);
@@ -1329,6 +1342,13 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             }
         }
         Expr::Set(set) => {
+            if checker.is_rule_enabled(Rule::ImplicitStringConcatenationInCollectionLiteral) {
+                flake8_implicit_str_concat::rules::implicit_string_concatenation_in_collection_literal(
+                    checker,
+                    expr,
+                    &set.elts,
+                );
+            }
             if checker.is_rule_enabled(Rule::DuplicateValue) {
                 flake8_bugbear::rules::duplicate_value(checker, set);
             }

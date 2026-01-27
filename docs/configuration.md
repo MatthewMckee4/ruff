@@ -352,6 +352,7 @@ For example, without `force-exclude` enabled, `ruff check /path/to/excluded/file
 ### Default inclusions
 
 By default, Ruff will discover files matching `*.py`, `*.pyi`, `*.ipynb`, or `pyproject.toml`.
+In [preview](preview.md) mode, Ruff will also discover `*.pyw` by default.
 
 To lint or format files with additional file extensions, use the [`extend-include`](settings.md#extend-include) setting.
 You can also change the default selection using the [`include`](settings.md#include) setting.
@@ -609,7 +610,7 @@ Options:
           RUFF_OUTPUT_FILE=]
       --target-version <TARGET_VERSION>
           The minimum Python version that should be supported [possible values:
-          py37, py38, py39, py310, py311, py312, py313, py314]
+          py37, py38, py39, py310, py311, py312, py313, py314, py315]
       --preview
           Enable preview mode; checks will include unstable rules and fixes.
           Use `--no-preview` to disable
@@ -725,7 +726,7 @@ Options:
           notebooks, use `--extension ipy:ipynb`
       --target-version <TARGET_VERSION>
           The minimum Python version that should be supported [possible values:
-          py37, py38, py39, py310, py311, py312, py313, py314]
+          py37, py38, py39, py310, py311, py312, py313, py314, py315]
       --preview
           Enable preview mode; enables unstable formatting. Use `--no-preview`
           to disable

@@ -69,7 +69,7 @@ class D:
     y: str = "default"
     z: int | None = 1 + 2
 
-reveal_type(D.__init__)  # revealed: (self: D, x: int, y: str = Literal["default"], z: int | None = Literal[3]) -> None
+reveal_type(D.__init__)  # revealed: (self: D, x: int, y: str = "default", z: int | None = 3) -> None
 ```
 
 This also works if the declaration and binding are split:
@@ -221,7 +221,7 @@ class D:
     (x): int = 1
 
 # TODO: should ideally not include a `x` parameter
-reveal_type(D.__init__)  # revealed: (self: D, x: int = Literal[1]) -> None
+reveal_type(D.__init__)  # revealed:(self: D, x: int = 1) -> None
 ```
 
 ## `@dataclass` calls with arguments
@@ -443,7 +443,7 @@ frozen_instance = MyFrozenClass(1)
 frozen_instance.x = 2  # error: [invalid-assignment]
 ```
 
-If `__setattr__()` or `__delattr__()` is defined in the class, we should emit a diagnostic.
+If `__setattr__()` or `__delattr__()` is defined in the class, a diagnostic is emitted.
 
 ```py
 from dataclasses import dataclass
@@ -452,10 +452,10 @@ from dataclasses import dataclass
 class MyFrozenClass:
     x: int
 
-    # TODO: Emit a diagnostic here
+    # error: [invalid-dataclass-override] "Cannot overwrite attribute `__setattr__` in class `MyFrozenClass`"
     def __setattr__(self, name: str, value: object) -> None: ...
 
-    # TODO: Emit a diagnostic here
+    # error: [invalid-dataclass-override] "Cannot overwrite attribute `__delattr__` in class `MyFrozenClass`"
     def __delattr__(self, name: str) -> None: ...
 ```
 
@@ -519,6 +519,73 @@ class MyFrozenChildClass(MyFrozenClass): ...
 
 frozen = MyFrozenChildClass()
 del frozen.x  # TODO this should emit an [invalid-assignment]
+```
+
+### frozen/non-frozen inheritance
+
+If a non-frozen dataclass inherits from a frozen dataclass, an exception is raised at runtime. We
+catch this error:
+
+<!-- snapshot-diagnostics -->
+
+`a.py`:
+
+```py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class FrozenBase:
+    x: int
+
+@dataclass
+# error: [invalid-frozen-dataclass-subclass] "Non-frozen dataclass `Child` cannot inherit from frozen dataclass `FrozenBase`"
+class Child(FrozenBase):
+    y: int
+```
+
+Frozen dataclasses inheriting from non-frozen dataclasses are also illegal:
+
+`b.py`:
+
+```py
+from dataclasses import dataclass
+
+@dataclass
+class Base:
+    x: int
+
+@dataclass(frozen=True)
+# error: [invalid-frozen-dataclass-subclass] "Frozen dataclass `FrozenChild` cannot inherit from non-frozen dataclass `Base`"
+class FrozenChild(Base):
+    y: int
+```
+
+Example of diagnostics when there are multiple files involved:
+
+`module.py`:
+
+```py
+import dataclasses
+
+@dataclasses.dataclass(frozen=False)
+class NotFrozenBase:
+    x: int
+```
+
+`main.py`:
+
+```py
+from functools import total_ordering
+from typing import final
+from dataclasses import dataclass
+
+from module import NotFrozenBase
+
+@final
+@dataclass(frozen=True)
+@total_ordering  # error: [invalid-total-ordering]
+class FrozenChild(NotFrozenBase):  # error: [invalid-frozen-dataclass-subclass]
+    y: str
 ```
 
 ### `match_args`
@@ -603,7 +670,7 @@ class A:
     a: str = field(kw_only=False)
     b: int = 0
 
-reveal_type(A.__init__)  # revealed: (self: A, a: str, *, b: int = Literal[0]) -> None
+reveal_type(A.__init__)  # revealed:(self: A, a: str, *, b: int = 0) -> None
 
 A("hi")
 ```
@@ -699,6 +766,111 @@ Employee(e_id=1, name="Alice")
 Employee("Alice", e_id=1)
 
 Employee("Alice", 1)  # error: [too-many-positional-arguments]
+```
+
+### Inherited fields with class-level `kw_only`
+
+When a child dataclass uses `@dataclass(kw_only=True)`, the `kw_only` setting should only apply to
+fields defined in the child class, not to inherited fields from parent classes.
+
+This is a regression test for <https://github.com/astral-sh/ty/issues/1769>.
+
+```toml
+[environment]
+python-version = "3.10"
+```
+
+```py
+from dataclasses import dataclass
+
+@dataclass
+class Inner:
+    inner: int
+
+@dataclass(kw_only=True)
+class Outer(Inner):
+    outer: int
+
+# Inherited field `inner` is positional, new field `outer` is keyword-only
+reveal_type(Outer.__init__)  # revealed: (self: Outer, inner: int, *, outer: int) -> None
+
+Outer(0, outer=5)  # OK
+Outer(inner=0, outer=5)  # Also OK
+# error: [missing-argument]
+# error: [too-many-positional-arguments]
+Outer(0, 5)
+```
+
+This also works when the parent class uses the `KW_ONLY` sentinel:
+
+```py
+from dataclasses import dataclass, KW_ONLY
+
+@dataclass
+class Parent:
+    a: int
+    _: KW_ONLY
+    b: str
+
+@dataclass(kw_only=True)
+class Child(Parent):
+    c: bytes
+
+# `a` is positional (from parent), `b` is keyword-only (from parent's KW_ONLY),
+# `c` is keyword-only (from child's kw_only=True)
+reveal_type(Child.__init__)  # revealed: (self: Child, a: int, *, b: str, c: bytes) -> None
+
+Child(1, b="hello", c=b"world")  # OK
+# error: [missing-argument] "No arguments provided for required parameters `b`, `c`"
+# error: [too-many-positional-arguments]
+Child(1, "hello", b"world")
+```
+
+And when the child class uses the `KW_ONLY` sentinel while inheriting from a parent:
+
+```py
+from dataclasses import dataclass, KW_ONLY
+
+@dataclass
+class Base:
+    x: int
+
+@dataclass
+class Derived(Base):
+    y: str
+    _: KW_ONLY
+    z: bytes
+
+# `x` and `y` are positional, `z` is keyword-only (from Derived's KW_ONLY)
+reveal_type(Derived.__init__)  # revealed: (self: Derived, x: int, y: str, *, z: bytes) -> None
+
+Derived(1, "hello", z=b"world")  # OK
+# error: [missing-argument]
+# error: [too-many-positional-arguments]
+Derived(1, "hello", b"world")
+```
+
+The reverse case also works: when a parent has `kw_only=True` but the child doesn't, the parent's
+fields stay keyword-only while the child's fields are positional:
+
+```py
+from dataclasses import dataclass
+
+@dataclass(kw_only=True)
+class KwOnlyParent:
+    parent_field: int
+
+@dataclass
+class PositionalChild(KwOnlyParent):
+    child_field: str
+
+# `child_field` is positional (child's default), `parent_field` stays keyword-only
+reveal_type(PositionalChild.__init__)  # revealed: (self: PositionalChild, child_field: str, *, parent_field: int) -> None
+
+PositionalChild("hello", parent_field=1)  # OK
+# error: [missing-argument]
+# error: [too-many-positional-arguments]
+PositionalChild("hello", 1)
 ```
 
 ### `slots`
@@ -819,7 +991,7 @@ class C:
     class_variable1: ClassVar[Final[int]] = 1
     class_variable2: ClassVar[Final[int]] = 1
 
-reveal_type(C.__init__)  # revealed: (self: C, instance_variable_no_default: int, instance_variable: int = Literal[1]) -> None
+reveal_type(C.__init__)  # revealed:(self: C, instance_variable_no_default: int, instance_variable: int = 1) -> None
 
 c = C(1)
 # error: [invalid-assignment] "Cannot assign to final attribute `instance_variable` on type `C`"
@@ -910,7 +1082,7 @@ class C(Base):
     z: int = 10
     x: int = 15
 
-reveal_type(C.__init__)  # revealed: (self: C, x: int = Literal[15], y: int = Literal[0], z: int = Literal[10]) -> None
+reveal_type(C.__init__)  # revealed:(self: C, x: int = 15, y: int = 0, z: int = 10) -> None
 ```
 
 ## Conditionally defined fields
@@ -1036,7 +1208,7 @@ def uses_dataclass[T](x: T) -> ChildOfParentDataclass[T]:
 # revealed: (self: ParentDataclass[Unknown], value: Unknown) -> None
 reveal_type(ParentDataclass.__init__)
 
-# revealed: (self: ParentDataclass[T@ChildOfParentDataclass], value: T@ChildOfParentDataclass) -> None
+# revealed: [T](self: ParentDataclass[T], value: T) -> None
 reveal_type(ChildOfParentDataclass.__init__)
 
 result_int = uses_dataclass(42)
@@ -1071,7 +1243,7 @@ class UppercaseString:
 class C:
     upper: UppercaseString = UppercaseString()
 
-reveal_type(C.__init__)  # revealed: (self: C, upper: str = str) -> None
+reveal_type(C.__init__)  # revealed: (self: C, upper: str = ...) -> None
 
 c = C("abc")
 reveal_type(c.upper)  # revealed: str
@@ -1117,7 +1289,7 @@ class ConvertToLength:
 class C:
     converter: ConvertToLength = ConvertToLength()
 
-reveal_type(C.__init__)  # revealed: (self: C, converter: str = Literal[""]) -> None
+reveal_type(C.__init__)  # revealed: (self: C, converter: str = "") -> None
 
 c = C("abc")
 reveal_type(c.converter)  # revealed: int
@@ -1156,7 +1328,7 @@ class AcceptsStrAndInt:
 class C:
     field: AcceptsStrAndInt = AcceptsStrAndInt()
 
-reveal_type(C.__init__)  # revealed: (self: C, field: str | int = int) -> None
+reveal_type(C.__init__)  # revealed: (self: C, field: str | int = ...) -> None
 ```
 
 ## `dataclasses.field`
@@ -1461,4 +1633,315 @@ from unittest.mock import Mock
 def test_c():
     c = C(1)
     c.__lt__ = Mock()
+```
+
+## Imperatively calling `dataclasses.dataclass`
+
+While we do not currently recognize the special behaviour of `dataclasses.dataclass` if it is called
+imperatively, we recognize that it can be called imperatively and do not emit any false-positive
+diagnostics on such calls:
+
+```py
+from dataclasses import dataclass
+from typing_extensions import TypeVar, dataclass_transform
+
+U = TypeVar("U")
+
+@dataclass_transform(kw_only_default=True)
+def sequence(cls: type[U]) -> type[U]:
+    d = dataclass(
+        repr=False,
+        eq=False,
+        match_args=False,
+        kw_only=True,
+    )(cls)
+    reveal_type(d)  # revealed: type[U@sequence] & Any
+    return d
+
+@dataclass_transform(kw_only_default=True)
+def sequence2(cls: type) -> type:
+    d = dataclass(
+        repr=False,
+        eq=False,
+        match_args=False,
+        kw_only=True,
+    )(cls)
+    reveal_type(d)  # revealed: type & Any
+    return d
+
+@dataclass_transform(kw_only_default=True)
+def sequence3(cls: type[U]) -> type[U]:
+    # TODO: should reveal `type[U@sequence3]`
+    return reveal_type(dataclass(cls))  # revealed: Unknown
+
+@dataclass_transform(kw_only_default=True)
+def sequence4(cls: type) -> type:
+    # TODO: should reveal `type`
+    return reveal_type(dataclass(cls))  # revealed: Unknown
+
+class Foo: ...
+
+ordered_foo = dataclass(order=True)(Foo)
+reveal_type(ordered_foo)  # revealed: <class 'Foo'>
+reveal_type(ordered_foo())  # revealed: Foo
+reveal_type(ordered_foo() < ordered_foo())  # revealed: bool
+```
+
+## Dynamic class literals
+
+Dynamic classes created with `type()` can be wrapped with `dataclass()` as a function:
+
+```py
+from dataclasses import dataclass
+
+# Basic dynamic class wrapped with dataclass
+DynamicFoo = type("DynamicFoo", (), {})
+DynamicFoo = dataclass(DynamicFoo)
+
+# The class is recognized as a dataclass
+reveal_type(DynamicFoo.__dataclass_fields__)  # revealed: dict[str, Field[Any]]
+
+# Can create instances
+instance = DynamicFoo()
+reveal_type(instance)  # revealed: DynamicFoo
+```
+
+Dynamic classes that inherit from a dataclass base also work:
+
+```py
+from dataclasses import dataclass
+
+@dataclass
+class Base:
+    x: int
+
+# Dynamic class inheriting from a dataclass
+DynamicChild = type("DynamicChild", (Base,), {})
+DynamicChild = dataclass(DynamicChild)
+
+reveal_type(DynamicChild.__dataclass_fields__)  # revealed: dict[str, Field[Any]]
+```
+
+## Invalid `@dataclass` applications
+
+### NamedTuple classes (functional form)
+
+Applying `@dataclass` to a `namedtuple` class created via the functional form is problematic because
+the namedtuple machinery conflicts with dataclass semantics:
+
+```py
+from collections import namedtuple
+from dataclasses import dataclass
+
+NT = namedtuple("NT", "x y")
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass(NT)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass()(NT)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass(namedtuple("Inline1", "a b"))
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass()(namedtuple("Inline2", "a b"))
+```
+
+The same applies to `typing.NamedTuple` used in functional form:
+
+```py
+from dataclasses import dataclass
+from typing import NamedTuple
+
+TNT = NamedTuple("TNT", [("x", int), ("y", int)])
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass(TNT)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass()(TNT)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass(NamedTuple("Inline1", [("a", str)]))
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass()(NamedTuple("Inline2", [("a", str)]))
+```
+
+### Enum classes (functional form)
+
+Applying `@dataclass` to a functional `Enum` class should also be detected:
+
+```py
+from dataclasses import dataclass
+from enum import Enum
+
+E = Enum("E", "A B C")
+
+# TODO: should emit `invalid-dataclass`
+dataclass(E)
+
+# TODO: should emit `invalid-dataclass`
+dataclass()(E)
+
+# TODO: should emit `invalid-dataclass`
+dataclass(Enum("Inline1", "X Y"))
+
+# TODO: should emit `invalid-dataclass`
+dataclass()(Enum("Inline2", "X Y"))
+```
+
+### TypedDict classes (functional form)
+
+Applying `@dataclass` to a functional `TypedDict` class should also be detected:
+
+```py
+from dataclasses import dataclass
+from typing import TypedDict
+
+TD = TypedDict("TD", {"x": int})
+
+# TODO: should emit `invalid-dataclass`
+dataclass(TD)
+
+# TODO: should emit `invalid-dataclass`
+dataclass()(TD)
+
+# TODO: should emit `invalid-dataclass`
+dataclass(TypedDict("Inline1", {"a": str}))
+
+# TODO: should emit `invalid-dataclass`
+dataclass()(TypedDict("Inline2", {"a": str}))
+```
+
+### Enum classes
+
+Applying `@dataclass` to an enum class is
+[explicitly not supported](https://docs.python.org/3/howto/enum.html#dataclass-support):
+
+```py
+from dataclasses import dataclass
+from enum import Enum
+
+@dataclass
+# error: [invalid-dataclass] "Enum class `Color` cannot be decorated with `@dataclass`"
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+```
+
+This also applies to classes that inherit from an enum class:
+
+```py
+from dataclasses import dataclass
+from enum import Enum
+
+class BaseColor(Enum):
+    def fancy_mixin_method(self) -> str:
+        return "hi"
+
+@dataclass
+# error: [invalid-dataclass]
+class Color(BaseColor):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+```
+
+### Protocol classes
+
+Applying `@dataclass` to a protocol class is invalid because protocols define abstract interfaces
+and cannot be instantiated:
+
+```py
+from dataclasses import dataclass
+from typing import Protocol
+
+@dataclass
+# error: [invalid-dataclass] "Protocol class `Greeter` cannot be decorated with `@dataclass`"
+class Greeter(Protocol):
+    def greet(self) -> str: ...
+```
+
+This also applies to classes that extend a protocol while remaining a protocol themselves:
+
+```py
+from dataclasses import dataclass
+from typing import Protocol
+
+class BaseProtocol(Protocol):
+    def method(self) -> None: ...
+
+@dataclass
+# error: [invalid-dataclass]
+class ExtendedProtocol(BaseProtocol, Protocol):
+    def other_method(self) -> None: ...
+```
+
+However, concrete classes that implement a protocol (without inheriting from `Protocol` directly)
+can be decorated with `@dataclass`:
+
+```py
+from dataclasses import dataclass
+from typing import Protocol
+
+class Greetable(Protocol):
+    name: str
+    def greet(self) -> str: ...
+
+@dataclass
+class Person(Greetable):
+    name: str
+    def greet(self) -> str:
+        return f"Hello, {self.name}!"
+
+reveal_type(Person)  # revealed: <class 'Person'>
+```
+
+### Using `dataclass()` as a function
+
+The same restrictions apply when using `dataclass()` as a function call instead of a decorator:
+
+```py
+from dataclasses import dataclass
+from typing import NamedTuple, TypedDict, Protocol
+from enum import Enum
+
+class MyTuple(NamedTuple):
+    x: int
+
+class MyDict(TypedDict):
+    x: int
+
+class MyEnum(Enum):
+    A = 1
+
+class MyProtocol(Protocol):
+    def method(self) -> None: ...
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass(MyTuple)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `NamedTuple` class"
+dataclass()(MyTuple)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `TypedDict` class"
+dataclass(MyDict)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a `TypedDict` class"
+dataclass()(MyDict)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on an enum class"
+dataclass(MyEnum)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on an enum class"
+dataclass()(MyEnum)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a protocol class"
+dataclass(MyProtocol)
+
+# error: [invalid-dataclass] "Cannot use `dataclass()` on a protocol class"
+dataclass()(MyProtocol)
 ```
