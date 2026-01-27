@@ -855,7 +855,7 @@ impl SrcOptions {
 )]
 #[serde(rename_all = "kebab-case", transparent)]
 pub struct Rules {
-    inner: OrderMap<RangedValue<String>, RangedValue<Level>, BuildHasherDefault<FxHasher>>,
+    pub inner: OrderMap<RangedValue<String>, RangedValue<Level>, BuildHasherDefault<FxHasher>>,
 }
 
 impl FromIterator<(RangedValue<String>, RangedValue<Level>)> for Rules {

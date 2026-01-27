@@ -23,14 +23,16 @@ use ty_module_resolver::{KnownModule, Module, ModuleName, resolve_module};
 
 use type_ordering::union_or_intersection_elements_ordering;
 
-pub(crate) use self::builder::{IntersectionBuilder, UnionBuilder};
+pub(crate) use self::builder::IntersectionBuilder;
+pub(crate) use self::builder::UnionBuilder;
 pub(crate) use self::class::DynamicClassLiteral;
 pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::{PairVisitor, TypeTransformer};
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{TypeCheckDiagnostics, UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
+pub use self::infer::TypeContext;
 pub(crate) use self::infer::{
-    TypeContext, infer_complete_scope_types, infer_deferred_types, infer_definition_types,
+    infer_complete_scope_types, infer_deferred_types, infer_definition_types,
     infer_expression_type, infer_expression_types, infer_scope_types, static_expression_truthiness,
 };
 pub use self::signatures::ParameterKind;
@@ -986,7 +988,7 @@ impl<'db> Type<'db> {
         .recursive_type_normalized(db, cycle)
     }
 
-    fn is_none(&self, db: &'db dyn Db) -> bool {
+    pub fn is_none(&self, db: &'db dyn Db) -> bool {
         self.is_instance_of(db, KnownClass::NoneType)
     }
 
@@ -7906,7 +7908,7 @@ impl<'db> TypeVarInstance<'db> {
         self.kind(db).is_paramspec()
     }
 
-    pub(crate) fn upper_bound(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    pub fn upper_bound(self, db: &'db dyn Db) -> Option<Type<'db>> {
         if let Some(TypeVarBoundOrConstraints::UpperBound(ty)) = self.bound_or_constraints(db) {
             Some(ty)
         } else {
