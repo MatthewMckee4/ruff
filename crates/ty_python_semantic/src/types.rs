@@ -24,7 +24,7 @@ use ty_module_resolver::{KnownModule, Module, ModuleName, resolve_module};
 use type_ordering::union_or_intersection_elements_ordering;
 
 pub(crate) use self::builder::IntersectionBuilder;
-pub(crate) use self::builder::UnionBuilder;
+pub use self::builder::UnionBuilder;
 pub(crate) use self::class::DynamicClassLiteral;
 pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::{PairVisitor, TypeTransformer};
