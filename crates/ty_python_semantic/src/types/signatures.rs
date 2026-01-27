@@ -1686,7 +1686,7 @@ impl<'db> Signature<'db> {
         Self { definition, ..self }
     }
 
-    pub fn parameter_annotated_types(&self) -> Vec<Option<Type<'db>>> {
+    pub fn parameter_annotated_types(&self) -> Vec<Type<'db>> {
         self.parameters
             .iter()
             .map(Parameter::annotated_type)
